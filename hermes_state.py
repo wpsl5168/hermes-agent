@@ -449,9 +449,10 @@ class SessionDB:
                 # 2. vec0 virtual table (only if sqlite-vec is loaded)
                 if self._vec_available:
                     try:
+                        from agent.embedding_client import EMBEDDING_DIM
                         cursor.execute(
                             "CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_vec "
-                            "USING vec0(embedding float[1536])"
+                            f"USING vec0(embedding float[{EMBEDDING_DIM}])"
                         )
                     except Exception as e:
                         logger.warning("Failed to create vec0 table: %s", e)
@@ -486,9 +487,10 @@ class SessionDB:
                 cursor.execute("SELECT * FROM embeddings_vec LIMIT 0")
             except sqlite3.OperationalError:
                 try:
+                    from agent.embedding_client import EMBEDDING_DIM
                     cursor.execute(
                         "CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_vec "
-                        "USING vec0(embedding float[1536])"
+                        f"USING vec0(embedding float[{EMBEDDING_DIM}])"
                     )
                 except Exception as e:
                     logger.warning("Failed to create vec0 table: %s", e)

@@ -595,8 +595,8 @@ class MemoryStore:
         try:
             db = self._session_db
             if getattr(db, "_vec_available", False):
-                from agent.embedding_client import get_embedding
-                query_vec = get_embedding(query)
+                from agent.embedding_client import get_query_embedding
+                query_vec = get_query_embedding(query)
                 if query_vec is not None:
                     raw_vec = db.search_embeddings(
                         query_vec, source_type="memory", limit=limit * 2,

@@ -391,8 +391,8 @@ def session_search(
         vec_session_ids = {}  # session_id -> {distance, source_id, ...}
         try:
             if getattr(db, "_vec_available", False):
-                from agent.embedding_client import get_embedding
-                query_vec = get_embedding(query)
+                from agent.embedding_client import get_query_embedding
+                query_vec = get_query_embedding(query)
                 if query_vec is not None:
                     vec_results = db.search_embeddings(
                         query_vec, source_type="session", limit=limit * 3,
