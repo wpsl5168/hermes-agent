@@ -550,6 +550,37 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def get_lineage_summary(self, session_id: str) -> str | None:
+        """Walk the parent chain and return the most recent compression summary.
+
+        After context compression the old session stores a structured
+        summary.  The new continuation session can load that summary to
+        keep accumulated knowledge in its system prompt, preventing
+        progressive information loss across multiple compactions.
+
+        Returns the first non-null summary found walking up the parent
+        chain, or None if no ancestor has a summary.
+        """
+        conn = self._conn
+        current_id = session_id
+        # Walk up to 10 levels (safety bound to prevent infinite loops)
+        for _ in range(10):
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (current_id,),
+            ).fetchone()
+            if not row or not row[0]:
+                return None
+            parent_id = row[0]
+            summary_row = conn.execute(
+                "SELECT summary FROM sessions WHERE id = ?",
+                (parent_id,),
+            ).fetchone()
+            if summary_row and summary_row[0]:
+                return summary_row[0]
+            current_id = parent_id
+        return None
+
     def get_recent_summaries(
         self,
         limit: int = 3,

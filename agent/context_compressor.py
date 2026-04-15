@@ -59,6 +59,14 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
+# Microcompaction: large tool outputs above this char threshold are saved
+# to disk and replaced with a summary + disk reference.  This prevents
+# single large outputs (test suites, big file reads, etc.) from dominating
+# the context window.  Applied BEFORE compression, including in the tail.
+_MICROCOMPACTION_THRESHOLD = 15_000  # chars (~3750 tokens)
+_MICROCOMPACTION_KEEP_HEAD = 1500    # chars kept inline from the start
+_MICROCOMPACTION_KEEP_TAIL = 500     # chars kept inline from the end
+
 
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Create an informative 1-line summary of a tool call + result.
@@ -325,6 +333,86 @@ class ContextCompressor(ContextEngine):
                 )
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # Microcompaction: save oversized tool outputs to disk
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _microcompact_large_outputs(
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Replace oversized tool results with a truncated version + disk reference.
+
+        Unlike the pruning pass (which only targets old/non-tail messages),
+        microcompaction applies to ALL tool results — including the
+        protected tail — because a single 200-line test output or 3000-line
+        file read can burn through context budget at any position.
+
+        The full output is saved to ``~/.hermes/compaction_cache/`` so the
+        model can reference it if needed.  Inline, we keep the first/last
+        few lines plus a 1-line summary.
+
+        Returns (messages_copy, compacted_count).
+        """
+        import os
+        from pathlib import Path
+        try:
+            from hermes_constants import get_hermes_home
+            cache_dir = get_hermes_home() / "compaction_cache"
+        except ImportError:
+            cache_dir = Path.home() / ".hermes" / "compaction_cache"
+
+        result = [m.copy() for m in messages]
+        compacted = 0
+
+        # Build tool_call_id -> (tool_name, arguments) index for summaries
+        call_index: Dict[str, tuple] = {}
+        for msg in result:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict):
+                        cid = tc.get("id", "")
+                        fn = tc.get("function", {})
+                        call_index[cid] = (fn.get("name", ""), fn.get("arguments", ""))
+
+        for i, msg in enumerate(result):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            if len(content) < _MICROCOMPACTION_THRESHOLD:
+                continue
+
+            # Save full output to disk
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+                cache_file = cache_dir / f"{content_hash}.txt"
+                if not cache_file.exists():
+                    cache_file.write_text(content, encoding="utf-8")
+                disk_path = str(cache_file)
+            except Exception:
+                disk_path = None
+
+            # Generate summary line
+            tool_id = msg.get("tool_call_id", "")
+            tool_name, tool_args = call_index.get(tool_id, ("unknown", ""))
+            summary_line = _summarize_tool_result(tool_name, tool_args, content)
+
+            # Build truncated replacement
+            head = content[:_MICROCOMPACTION_KEEP_HEAD]
+            tail = content[-_MICROCOMPACTION_KEEP_TAIL:]
+            omitted = len(content) - _MICROCOMPACTION_KEEP_HEAD - _MICROCOMPACTION_KEEP_TAIL
+            disk_note = f"\n[Full output saved to: {disk_path}]" if disk_path else ""
+            replacement = (
+                f"{head}\n\n"
+                f"... [{omitted:,} chars omitted — {summary_line}]{disk_note}\n\n"
+                f"{tail}"
+            )
+            result[i] = {**msg, "content": replacement}
+            compacted += 1
+
+        return result, compacted
 
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
@@ -955,6 +1043,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             return messages
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+
+        # Phase 0: Microcompaction — save oversized tool outputs to disk
+        # Applied before everything else, including tail protection, because
+        # a single huge output can dominate context at any position.
+        messages, mc_count = self._microcompact_large_outputs(messages)
+        if mc_count and not self.quiet_mode:
+            logger.info("Microcompaction: saved %d oversized tool output(s) to disk", mc_count)
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(

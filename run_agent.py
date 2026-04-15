@@ -3638,6 +3638,26 @@ class AIAgent:
             except Exception:
                 pass
 
+        # Session lineage memory — inject the compression summary from the
+        # immediate parent session.  This is the structured summary
+        # generated during compaction and persisted via save_summary().
+        # Unlike "Recent Session Context" (which shows OTHER sessions),
+        # this preserves accumulated knowledge from the CURRENT session's
+        # earlier compaction cycles, preventing progressive info loss.
+        if self._session_db and self.session_id:
+            try:
+                lineage_summary = self._session_db.get_lineage_summary(self.session_id)
+                if lineage_summary:
+                    prompt_parts.append(
+                        "## Current Session Memory\n"
+                        "The following is the accumulated context from earlier in this "
+                        "session (before context compression). Use it as background "
+                        "reference — do not re-execute completed work.\n\n"
+                        + lineage_summary
+                    )
+            except Exception:
+                pass
+
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
             avail_toolsets = {
@@ -7209,6 +7229,62 @@ class AIAgent:
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
 
+        # ------------------------------------------------------------------
+        # Rehydration: auto-reload recently edited files after compression.
+        #
+        # Inspired by Claude Code — after compaction the model loses the
+        # actual content of files it was just working on.  Re-reading the
+        # most recently touched files keeps the model grounded in the
+        # current codebase state and prevents drift.
+        #
+        # Budget: up to 5 files, ~5K chars each, ~50K total.
+        # ------------------------------------------------------------------
+        _REHYDRATE_MAX_FILES = 5
+        _REHYDRATE_CHARS_PER_FILE = 5000
+        try:
+            from tools.file_tools import get_recent_files
+            recent = get_recent_files(task_id, limit=_REHYDRATE_MAX_FILES)
+            if recent:
+                rehydrated_parts = []
+                for fpath, _mtime in recent:
+                    try:
+                        p = Path(fpath)
+                        if not p.is_file() or p.stat().st_size > 500_000:
+                            continue  # skip missing/huge files
+                        # Skip binary-looking files
+                        if p.suffix.lower() in {
+                            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+                            ".woff", ".woff2", ".ttf", ".otf", ".eot",
+                            ".zip", ".tar", ".gz", ".bz2", ".7z",
+                            ".pyc", ".pyo", ".so", ".dll", ".exe",
+                            ".db", ".sqlite", ".sqlite3",
+                            ".pdf", ".mp3", ".mp4", ".ogg", ".wav",
+                        }:
+                            continue
+                        raw = p.read_text(errors="replace")
+                        snippet = raw[:_REHYDRATE_CHARS_PER_FILE]
+                        if len(raw) > _REHYDRATE_CHARS_PER_FILE:
+                            snippet += f"\n... [{len(raw) - _REHYDRATE_CHARS_PER_FILE:,} more chars truncated]"
+                        rehydrated_parts.append(f"### {fpath}\n```\n{snippet}\n```")
+                    except Exception:
+                        continue  # skip unreadable files
+
+                if rehydrated_parts:
+                    header = (
+                        "[FILES REHYDRATED after context compression]\n"
+                        "The following files were recently read or edited in this session. "
+                        "They are re-loaded automatically so you stay aligned with the "
+                        "current codebase state.\n\n"
+                    )
+                    rehydration_msg = header + "\n\n".join(rehydrated_parts)
+                    compressed.append({"role": "user", "content": rehydration_msg})
+                    logger.info(
+                        "Rehydration: injected %d file(s) into compressed context",
+                        len(rehydrated_parts),
+                    )
+        except Exception as e:
+            logger.debug("Rehydration skipped: %s", e)
+
         self._invalidate_system_prompt()
         new_system_prompt = self._build_system_prompt(system_message)
         self._cached_system_prompt = new_system_prompt
@@ -7238,6 +7314,17 @@ class AIAgent:
                 self._session_db.update_system_prompt(self.session_id, new_system_prompt)
                 # Reset flush cursor — new session starts with no messages written
                 self._last_flushed_db_idx = 0
+
+                # Persist the compression summary to the old session so that
+                # the new continuation session can load it as "session memory"
+                # in its system prompt — preventing knowledge loss across
+                # multiple compactions.
+                try:
+                    _comp_summary = getattr(self.context_compressor, "_previous_summary", None)
+                    if _comp_summary and old_session_id:
+                        self._session_db.save_summary(old_session_id, _comp_summary)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 

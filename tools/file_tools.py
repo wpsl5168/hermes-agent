@@ -489,6 +489,26 @@ def notify_other_tool_call(task_id: str = "default"):
             task_data["consecutive"] = 0
 
 
+def get_recent_files(task_id: str = "default", limit: int = 5) -> list[tuple[str, float]]:
+    """Return the most recently accessed files for a task, sorted by mtime descending.
+
+    Used by the rehydration pass after context compression to know which
+    files to re-read into the compressed context.
+
+    Returns a list of (resolved_path, mtime) tuples.
+    """
+    with _read_tracker_lock:
+        task_data = _read_tracker.get(task_id)
+        if not task_data:
+            return []
+        timestamps = task_data.get("read_timestamps", {})
+        if not timestamps:
+            return []
+        # Sort by mtime descending (most recently touched first)
+        sorted_files = sorted(timestamps.items(), key=lambda x: x[1], reverse=True)
+        return sorted_files[:limit]
+
+
 def _update_read_timestamp(filepath: str, task_id: str) -> None:
     """Record the file's current modification time after a successful write.
 
