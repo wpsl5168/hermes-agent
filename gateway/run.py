@@ -2338,24 +2338,20 @@ class GatewayRunner:
             remove_pid_file()
 
             # Write a clean-shutdown marker so the next startup knows this
-            # wasn't a crash.  suspend_recently_active() only needs to run
-            # after unexpected exits.  However, if the drain timed out and
-            # agents were force-interrupted, their sessions may be in an
-            # incomplete state (trailing tool response, no final assistant
-            # message).  Skip the marker in that case so the next startup
-            # suspends those sessions — giving users a clean slate instead
-            # of resuming a half-finished tool loop.
-            if not timed_out:
-                try:
-                    (_hermes_home / ".clean_shutdown").touch()
-                except Exception:
-                    pass
-            else:
-                logger.info(
-                    "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
-                )
+            # was a graceful stop (signal-initiated), not a crash.
+            # suspend_recently_active() only needs to run after truly
+            # unexpected exits (OOM kill, power loss, segfault).
+            #
+            # Previously we skipped the marker when drain timed out, but
+            # that caused unwanted auto-resets on the next startup —
+            # losing the user's conversation history.  Drain timeout
+            # just means agents were slow to finish; the stuck-loop
+            # detector (_increment_restart_failure_counts) handles
+            # genuinely stuck sessions independently.
+            try:
+                (_hermes_home / ".clean_shutdown").touch()
+            except Exception:
+                pass
 
             # Track sessions that were active at shutdown for stuck-loop
             # detection (#7536).  On each restart, the counter increments

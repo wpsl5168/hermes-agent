@@ -1,0 +1,52 @@
+[
+  {
+    "title": "Context & Token Management | github/copilot-cli | DeepWiki",
+    "href": "https://deepwiki.com/github/copilot-cli/3.7-context-and-token-management",
+    "body": "Mar 26, 2026 · Each AI model has a maximum context window that limits how much conversation history it can process. The CLI tracks token usage against these limits to determine when compaction is …"
+  },
+  {
+    "title": "GitHub Copilot Context Limits: What 144k Tokens Mean for …",
+    "href": "https://devactivity.com/insights/unpacking-github-copilot-s-context-window-a-key-to-performance-engineering-software/",
+    "body": "Mar 17, 2026 · Developers are questioning GitHub Copilot's `claude-opus-4.6` context window. Discover how reported limits impact your `performance engineering software` workflows and what the …"
+  },
+  {
+    "title": "GitHub Copilot GPT-5 Production Optimization Guide - Mastering 196k ...",
+    "href": "https://smartscope.blog/en/ai-development/github-copilot-gpt5-production-workflow-optimization/",
+    "body": "Implementation strategies and workflow optimizations to maximize context and message limits in real-world GitHub Copilot GPT-5 operations"
+  },
+  {
+    "title": "GitHub · Change is constant. GitHub keeps you ahead.",
+    "href": "https://github.com/",
+    "body": "Join the world's most widely adopted, AI-powered developer platform where millions of developers, businesses, and the largest open source community build software that advances humanity."
+  },
+  {
+    "title": "Sign in to GitHub · GitHub",
+    "href": "https://github.com/login",
+    "body": "GitHub is where people build software. More than 150 million people use GitHub to discover, fork, and contribute to over 420 million projects."
+  },
+  {
+    "title": "GitHub",
+    "href": "https://github.com/github",
+    "body": "The open source community is the 💗 heart of GitHub and fundamental to how we build software today. See for yourself: GitHub Sponsors helped support more than 5k individuals and projects around the world 🌍 …"
+  },
+  {
+    "title": "openclaw · GitHub",
+    "href": "https://github.com/openclaw",
+    "body": "Your personal, open source AI assistant. openclaw has 24 repositories available. Follow their code on GitHub."
+  },
+  {
+    "title": "About GitHub",
+    "href": "https://github.com/about",
+    "body": "Learn more Social Impact Learn about how GitHub’s people, products, and platform are creating positive and lasting change around the world."
+  },
+  {
+    "title": "GitHub Copilot · Your AI pair programmer",
+    "href": "https://github.com/features/copilot",
+    "body": "GitHub Copilot works alongside you directly in your editor, suggesting whole lines or entire functions for you."
+  },
+  {
+    "title": "GitHub Docs",
+    "href": "https://docs.github.com/en",
+    "body": "GitHub Docs Set up Git At the heart of GitHub is an open-source version control system (VCS) called Git. Git is responsible for everything GitHub-related that happens locally on your computer."
+  }
+]

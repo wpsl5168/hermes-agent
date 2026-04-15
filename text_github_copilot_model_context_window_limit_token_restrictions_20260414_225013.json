@@ -1,0 +1,52 @@
+[
+  {
+    "title": "Context & Token Management | github/copilot-cli | DeepWiki",
+    "href": "https://deepwiki.com/github/copilot-cli/3.7-context-and-token-management",
+    "body": "Context Windows & Token Limits Each AI model has a maximum context window that limits how much conversation history it can process. The CLI tracks token usage against these limits to determine when compaction is necessary."
+  },
+  {
+    "title": "How can I increase Copilot Cloud Agent context window to avoid token ...",
+    "href": "https://github.com/orgs/community/discussions/180198",
+    "body": "The current limit appears to be ~64K tokens. Modern models like Claude 3.5/4.5 or GPT-4.1 support 200K-1M context windows. My question: Is there any way to configure Copilot Cloud Agents to use a larger context window or select a model with higher token limits? For example: Switching the underlying model to one with 128k or higher context"
+  },
+  {
+    "title": "Microsoft Copilot Context Window Token Limits and Memory",
+    "href": "https://www.datastudios.org/post/microsoft-copilot-context-window-token-limits-and-memory",
+    "body": "Microsoft Copilot functions across productivity apps in Microsoft 365, developer environments such as GitHub Copilot Chat, consumer web and mobile apps, and custom solutions built in Copilot Studio. Each of these contexts has different behavior when it comes to context windows, token handling, and memory. In late 2025, Microsoft has published practical guidance for document length and file ..."
+  },
+  {
+    "title": "Decoding Copilot's Context Window: Why LLM Limits Impact Developer ...",
+    "href": "https://devactivity.com/insights/decoding-copilots-context-window-why-llm-limits-impact-developer-performance/",
+    "body": "Explore why Copilot's Claude Opus context window is capped despite higher model capabilities, and how these limits affect developer performance metrics and workflow efficiency."
+  },
+  {
+    "title": "GitHub Copilot CLI: Enhanced model selection, image support, and ...",
+    "href": "https://github.blog/changelog/2025-10-03-github-copilot-cli-enhanced-model-selection-image-support-and-streamlined-ui/",
+    "body": "Truncation notification: Copilot CLI truncates the model's context when its token limit is reached. When you're getting close to truncation (≤ 20% context remaining), a warning will display above the input box. Enterprise and authentication improvements We've strengthened support for enterprise environments:"
+  },
+  {
+    "title": "GitHub Copilot Model Context Sizes (Nov 2025) - DEV Community",
+    "href": "https://dev.to/dr_furqanullah_8819ecd9/github-copilot-model-context-sizes-nov-2025-3nif",
+    "body": "💡 How big is that, really? Let's take Claude Sonnet 4.5 with a 200,000-token context window. If one C++ or JavaScript file has ~2,000 lines and each line averages ≈ 15 tokens (including code, spaces, and comments), → one file ≈ 30,000 tokens. That means Claude Sonnet 4.5 can process around 6 full files of 2,000 lines each at once."
+  },
+  {
+    "title": "Model Context Protocol and the \"too many tools\" problem.",
+    "href": "https://demiliani.com/2025/09/04/model-context-protocol-and-the-too-many-tools-problem/",
+    "body": "The hard limit reason is always the same: to prevent \"flooding\" the agent's context window with too many tools, which can degrade LLM's performance. The simple solution to avoid this \"too many exposed MCP tools\" problem is to deactivate the tools you don't need per conversation."
+  },
+  {
+    "title": "Does OpenCode Have Context Limit Issues with GitHub Copilot?",
+    "href": "https://docs.bswen.com/blog/2026-03-15-opencode-context-limits-github-copilot/",
+    "body": "Context limits are token-based restrictions on how much code and conversation history an AI assistant can \"see\" at once. GitHub Copilot typically operates with 8K to 32K token context windows depending on the underlying model."
+  },
+  {
+    "title": "Microsoft Copilot context window: token limits, memory policy, and 2025 ...",
+    "href": "https://www.datastudios.org/post/microsoft-copilot-context-window-token-limits-memory-policy-and-2025-rules",
+    "body": "Copilot's context window depends on the model it selects and the orchestration layer.Microsoft Copilot doesn't use a fixed model or static token limit—it dynamically chooses the best model for each task. In 2025, Copilot across Microsoft 365 and the web is powered primarily by GPT-4o, with ongoing migration to GPT-5. These models enforce technical token windows: for GPT-4o, up to 128,000 ..."
+  },
+  {
+    "title": "Why can't we fully utilize context_window? (Data from Copilot ... - GitHub",
+    "href": "https://github.com/orgs/community/discussions/186340",
+    "body": "The response includes three key fields for each model: limits.context_window — Reported total context capacity limits.max_prompt — Actual maximum input tokens allowed limits.max_output — Maximum output tokens per response The Problem: Utilization Rate"
+  }
+]
