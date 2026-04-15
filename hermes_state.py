@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -102,6 +102,26 @@ CREATE TABLE IF NOT EXISTS memory_entries (
 
 CREATE INDEX IF NOT EXISTS idx_memory_entries_target ON memory_entries(target);
 CREATE INDEX IF NOT EXISTS idx_memory_entries_accessed ON memory_entries(last_accessed_at DESC);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_dedup
+    ON embeddings(source_type, content_hash);
+CREATE INDEX IF NOT EXISTS idx_embeddings_source
+    ON embeddings(source_type, source_id);
+
+CREATE TABLE IF NOT EXISTS system_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 FTS_SQL = """
@@ -191,6 +211,17 @@ class SessionDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+
+        # Load sqlite-vec extension for vector search (best-effort).
+        self._vec_available = False
+        try:
+            import sqlite_vec
+            self._conn.enable_load_extension(True)
+            sqlite_vec.load(self._conn)
+            self._conn.enable_load_extension(False)
+            self._vec_available = True
+        except Exception as e:
+            logger.debug("sqlite-vec not available (vector search disabled): %s", e)
 
         self._init_schema()
 
@@ -391,6 +422,42 @@ class SessionDB:
                 """)
                 cursor.execute("UPDATE schema_version SET version = 8")
 
+            if current_version < 9:
+                # v9: vector search (sqlite-vec) + system metadata
+                # 1. embeddings metadata table
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS embeddings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_type TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_dedup
+                        ON embeddings(source_type, content_hash);
+                    CREATE INDEX IF NOT EXISTS idx_embeddings_source
+                        ON embeddings(source_type, source_id);
+
+                    CREATE TABLE IF NOT EXISTS system_meta (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                """)
+                # 2. vec0 virtual table (only if sqlite-vec is loaded)
+                if self._vec_available:
+                    try:
+                        cursor.execute(
+                            "CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_vec "
+                            "USING vec0(embedding float[1536])"
+                        )
+                    except Exception as e:
+                        logger.warning("Failed to create vec0 table: %s", e)
+                        self._vec_available = False
+                cursor.execute("UPDATE schema_version SET version = 9")
+
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
         try:
@@ -412,6 +479,20 @@ class SessionDB:
             cursor.execute("SELECT * FROM memory_entries_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(MEMORY_FTS_SQL)
+
+        # vec0 virtual table for vector search (sqlite-vec)
+        if self._vec_available:
+            try:
+                cursor.execute("SELECT * FROM embeddings_vec LIMIT 0")
+            except sqlite3.OperationalError:
+                try:
+                    cursor.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS embeddings_vec "
+                        "USING vec0(embedding float[1536])"
+                    )
+                except Exception as e:
+                    logger.warning("Failed to create vec0 table: %s", e)
+                    self._vec_available = False
 
         self._conn.commit()
 
@@ -1487,3 +1568,204 @@ class SessionDB:
                     "SELECT COUNT(*) FROM memory_entries"
                 ).fetchone()
         return row[0] if row else 0
+
+    # =========================================================================
+    # Vector embeddings (sqlite-vec)
+    # =========================================================================
+
+    def store_embedding(
+        self,
+        source_type: str,
+        source_id: str,
+        content: str,
+        embedding: "np.ndarray",
+        model: str,
+    ) -> bool:
+        """Store a text embedding. Deduplicates by (source_type, content_hash).
+
+        Returns True if stored, False on duplicate or error.
+        Requires sqlite-vec to be available.
+        """
+        if not self._vec_available:
+            return False
+
+        import hashlib
+        import numpy as np
+        from sqlite_vec import serialize_float32
+
+        chash = hashlib.sha256(content.encode()).hexdigest()[:16]
+
+        def _do(conn):
+            # Check for existing entry (dedup)
+            existing = conn.execute(
+                "SELECT id FROM embeddings WHERE source_type = ? AND content_hash = ?",
+                (source_type, chash),
+            ).fetchone()
+            if existing:
+                return False
+
+            # Insert metadata row first to get the rowid
+            conn.execute(
+                "INSERT INTO embeddings (source_type, source_id, content, content_hash, model, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (source_type, source_id, content, chash, model, time.time()),
+            )
+            rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            # Insert vector with matching rowid
+            vec_blob = serialize_float32(embedding.astype(np.float32))
+            conn.execute(
+                "INSERT INTO embeddings_vec (rowid, embedding) VALUES (?, ?)",
+                (rowid, vec_blob),
+            )
+            return True
+
+        try:
+            return self._execute_write(_do)
+        except Exception as e:
+            logger.warning("Failed to store embedding: %s", e)
+            return False
+
+    def search_embeddings(
+        self,
+        query_vec: "np.ndarray",
+        source_type: str = None,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Vector similarity search using sqlite-vec KNN.
+
+        Returns list of dicts: {source_type, source_id, content, distance}.
+        Lower distance = more similar.
+        """
+        if not self._vec_available:
+            return []
+
+        import numpy as np
+        from sqlite_vec import serialize_float32
+
+        try:
+            vec_blob = serialize_float32(query_vec.astype(np.float32))
+
+            # Over-fetch to allow filtering by source_type
+            fetch_limit = limit * 4 if source_type else limit
+            rows = self._conn.execute(
+                "SELECT rowid, distance FROM embeddings_vec "
+                "WHERE embedding MATCH ? AND k = ? "
+                "ORDER BY distance",
+                (vec_blob, fetch_limit),
+            ).fetchall()
+
+            results = []
+            for row in rows:
+                rowid = row[0] if isinstance(row, tuple) else row["rowid"]
+                distance = row[1] if isinstance(row, tuple) else row["distance"]
+                meta = self._conn.execute(
+                    "SELECT source_type, source_id, content FROM embeddings WHERE id = ?",
+                    (rowid,),
+                ).fetchone()
+                if not meta:
+                    continue
+                st = meta[0] if isinstance(meta, tuple) else meta["source_type"]
+                if source_type and st != source_type:
+                    continue
+                results.append({
+                    "source_type": st,
+                    "source_id": meta[1] if isinstance(meta, tuple) else meta["source_id"],
+                    "content": meta[2] if isinstance(meta, tuple) else meta["content"],
+                    "distance": float(distance),
+                })
+                if len(results) >= limit:
+                    break
+
+            return results
+
+        except Exception as e:
+            logger.warning("Vector search failed: %s", e)
+            return []
+
+    def delete_embeddings(self, source_type: str, source_id: str) -> int:
+        """Delete embeddings for a given source. Returns count deleted."""
+        if not self._vec_available:
+            return 0
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id FROM embeddings WHERE source_type = ? AND source_id = ?",
+                (source_type, source_id),
+            ).fetchall()
+            count = 0
+            for row in rows:
+                rowid = row[0] if isinstance(row, tuple) else row["id"]
+                conn.execute("DELETE FROM embeddings_vec WHERE rowid = ?", (rowid,))
+                conn.execute("DELETE FROM embeddings WHERE id = ?", (rowid,))
+                count += 1
+            return count
+
+        try:
+            return self._execute_write(_do)
+        except Exception as e:
+            logger.warning("Failed to delete embeddings: %s", e)
+            return 0
+
+    def embedding_count(self, source_type: str = None) -> int:
+        """Count stored embeddings, optionally filtered by source_type."""
+        try:
+            if source_type:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM embeddings WHERE source_type = ?",
+                    (source_type,),
+                ).fetchone()
+            else:
+                row = self._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()
+            return row[0] if row else 0
+        except Exception:
+            return 0
+
+    # =========================================================================
+    # System metadata (key-value store)
+    # =========================================================================
+
+    def get_meta(self, key: str) -> Optional[str]:
+        """Get a system metadata value by key."""
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM system_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row:
+                return row[0] if isinstance(row, tuple) else row["value"]
+        except Exception:
+            pass
+        return None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Set a system metadata value (insert or update)."""
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO system_meta (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, time.time()),
+            )
+        try:
+            self._execute_write(_do)
+        except Exception as e:
+            logger.warning("Failed to set meta %s: %s", key, e)
+
+    def increment_meta(self, key: str, default: int = 0) -> int:
+        """Atomically increment an integer metadata value. Returns new value."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM system_meta WHERE key = ?", (key,)
+            ).fetchone()
+            current = int(row[0] if row else default)
+            new_val = current + 1
+            conn.execute(
+                "INSERT INTO system_meta (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, str(new_val), time.time()),
+            )
+            return new_val
+        try:
+            return self._execute_write(_do)
+        except Exception as e:
+            logger.warning("Failed to increment meta %s: %s", key, e)
+            return default

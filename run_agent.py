@@ -1147,8 +1147,8 @@ class AIAgent:
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
                     self._memory_store = MemoryStore(
-                        memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                        user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_char_limit=mem_config.get("memory_char_limit", 4400),
+                        user_char_limit=mem_config.get("user_char_limit", 2750),
                         session_db=self._session_db,
                     )
                     self._memory_store.load_from_disk()
@@ -3044,6 +3044,8 @@ class AIAgent:
         self._spawn_auto_summary(messages or [])
         # Auto Memory Extraction — extract facts/preferences from conversation
         self._spawn_auto_extraction(messages or [])
+        # Auto Dream — check if memory consolidation is due
+        self._check_auto_dream()
 
     def _spawn_auto_summary(self, messages: list) -> None:
         """Generate a structured session summary in a background thread.
@@ -3127,8 +3129,26 @@ class AIAgent:
                 )
                 summary_text = response.choices[0].message.content
                 if summary_text and summary_text.strip():
-                    session_db.save_summary(session_id, summary_text.strip()[:1000])
+                    summary_clean = summary_text.strip()[:1000]
+                    session_db.save_summary(session_id, summary_clean)
                     logger.info("Auto session summary saved for %s", session_id)
+
+                    # Embed summary for vector search (best-effort)
+                    try:
+                        if getattr(session_db, "_vec_available", False):
+                            from agent.embedding_client import get_embedding, EMBEDDING_MODEL
+                            vec = get_embedding(summary_clean)
+                            if vec is not None:
+                                session_db.store_embedding(
+                                    source_type="session",
+                                    source_id=session_id,
+                                    content=summary_clean,
+                                    embedding=vec,
+                                    model=EMBEDDING_MODEL,
+                                )
+                                logger.info("Session summary embedding stored for %s", session_id)
+                    except Exception as emb_err:
+                        logger.debug("Failed to embed session summary: %s", emb_err)
             except Exception as e:
                 logger.debug("Auto session summary failed: %s", e)
 
@@ -3305,6 +3325,87 @@ class AIAgent:
 
         t = threading.Thread(target=_run_extraction, daemon=True, name="auto-extraction")
         t.start()
+
+    # ------------------------------------------------------------------
+    # Auto Dream — trigger memory consolidation when conditions are met
+    # ------------------------------------------------------------------
+
+    # Configurable constants
+    _AUTO_DREAM_INTERVAL_HOURS = 24
+    _AUTO_DREAM_SESSION_THRESHOLD = 5
+    _AUTO_DREAM_JOB_ID = "f060384e6a41"  # Dream A cron job
+
+    def _check_auto_dream(self) -> None:
+        """Check if Auto Dream should trigger and fire the Dream A cron job.
+
+        Uses OR logic — triggers when EITHER condition is met:
+        - Time gate: >= 24 hours since last dream
+        - Session gate: >= 5 sessions since last dream
+
+        Increments the session counter on every call. When triggered,
+        resets the counter and updates the timestamp, then fires the
+        Dream A cron job via trigger_job() (non-blocking — scheduler
+        picks it up on the next tick).
+        """
+        if not self._session_db:
+            return
+
+        # Skip for cron sessions (avoid dream triggering dream)
+        if self.session_id and self.session_id.startswith("cron_"):
+            return
+
+        # Skip for subagent/delegation sessions
+        if self.platform == "subagent":
+            return
+
+        try:
+            db = self._session_db
+
+            # Increment session counter
+            sessions_count = db.increment_meta("sessions_since_dream", default=0)
+
+            # Check time gate
+            last_dream_str = db.get_meta("last_dream_at")
+            time_gate_met = False
+            if last_dream_str is None:
+                # First run ever — set baseline, don't trigger yet
+                db.set_meta("last_dream_at", str(time.time()))
+                logger.debug("Auto Dream: initialized last_dream_at baseline")
+                return
+            else:
+                last_dream_ts = float(last_dream_str)
+                hours_elapsed = (time.time() - last_dream_ts) / 3600
+                time_gate_met = hours_elapsed >= self._AUTO_DREAM_INTERVAL_HOURS
+
+            # Check session gate
+            session_gate_met = sessions_count >= self._AUTO_DREAM_SESSION_THRESHOLD
+
+            if not time_gate_met and not session_gate_met:
+                logger.debug(
+                    "Auto Dream: not due (%.1fh elapsed, %d sessions)",
+                    hours_elapsed, sessions_count,
+                )
+                return
+
+            # Trigger Dream A
+            logger.info(
+                "Auto Dream triggered: time_gate=%s (%.1fh), session_gate=%s (%d sessions)",
+                time_gate_met, hours_elapsed, session_gate_met, sessions_count,
+            )
+
+            from cron.jobs import trigger_job
+            result = trigger_job(self._AUTO_DREAM_JOB_ID)
+            if result:
+                logger.info("Auto Dream: Dream A job triggered successfully")
+                # Reset counters
+                db.set_meta("last_dream_at", str(time.time()))
+                db.set_meta("sessions_since_dream", "0")
+            else:
+                logger.warning("Auto Dream: failed to trigger job %s (not found?)",
+                               self._AUTO_DREAM_JOB_ID)
+
+        except Exception as e:
+            logger.debug("Auto Dream check failed: %s", e)
 
     def close(self) -> None:
         """Release all resources held by this agent instance.

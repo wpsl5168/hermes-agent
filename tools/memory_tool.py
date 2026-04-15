@@ -120,7 +120,7 @@ class MemoryStore:
         overflow entries for long-term accumulation.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375,
+    def __init__(self, memory_char_limit: int = 4400, user_char_limit: int = 2750,
                  session_db=None):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
@@ -508,6 +508,8 @@ class MemoryStore:
             except Exception as e:
                 return {"success": False, "error": f"Failed to write to cold storage: {e}"}
 
+            self._embed_cold_entry(entry_id, content)
+
             # Remove from hot
             entries.pop(idx)
             self._set_entries(target, entries)
@@ -580,13 +582,46 @@ class MemoryStore:
 
     def search_cold(self, query: str, target: str = None,
                     limit: int = 10) -> Dict[str, Any]:
-        """Search cold memory using FTS5 full-text search."""
+        """Search cold memory using hybrid FTS5 + vector similarity."""
         if not self._session_db:
             return {"success": False, "error": "Cold memory storage not available (no session DB)."}
 
-        results = self._session_db.search_cold_memory(query, target=target, limit=limit)
+        # Path 1: FTS5 keyword search
+        fts_results = self._session_db.search_cold_memory(query, target=target, limit=limit)
+        fts_ids = {r["id"] for r in fts_results}
+
+        # Path 2: Vector similarity search (best-effort)
+        vec_results = []
+        try:
+            db = self._session_db
+            if getattr(db, "_vec_available", False):
+                from agent.embedding_client import get_embedding
+                query_vec = get_embedding(query)
+                if query_vec is not None:
+                    raw_vec = db.search_embeddings(
+                        query_vec, source_type="memory", limit=limit * 2,
+                    )
+                    for vr in raw_vec:
+                        try:
+                            eid = int(vr["source_id"])
+                        except (ValueError, TypeError):
+                            continue
+                        if eid not in fts_ids:
+                            entry = db.get_cold_memory(eid)
+                            if entry and (target is None or entry.get("target") == target):
+                                vec_results.append(entry)
+                                fts_ids.add(eid)
+                        if len(vec_results) >= limit:
+                            break
+        except Exception as e:
+            logging.debug("Vector search for cold memory skipped: %s", e)
+
+        # Merge: FTS first (keyword-exact), then vec hits
+        merged = fts_results + vec_results
+        merged = merged[:limit]
+
         # Touch accessed entries
-        for r in results:
+        for r in merged:
             try:
                 self._session_db.touch_cold_memory(r["id"])
             except Exception:
@@ -604,9 +639,9 @@ class MemoryStore:
                     "source": r.get("source", ""),
                     "access_count": r.get("access_count", 0),
                 }
-                for r in results
+                for r in merged
             ],
-            "result_count": len(results),
+            "result_count": len(merged),
             "total_cold_entries": total,
         }
 
@@ -629,6 +664,7 @@ class MemoryStore:
         except Exception as e:
             return {"success": False, "error": f"Failed to write to cold storage: {e}"}
 
+        self._embed_cold_entry(entry_id, content)
         total = self._session_db.cold_memory_count(target)
         return {
             "success": True,
@@ -636,6 +672,25 @@ class MemoryStore:
             "entry_id": entry_id,
             "total_cold_entries": total,
         }
+
+    def _embed_cold_entry(self, entry_id: int, content: str) -> None:
+        """Best-effort: embed a cold memory entry for vector search."""
+        try:
+            db = self._session_db
+            if not db or not getattr(db, "_vec_available", False):
+                return
+            from agent.embedding_client import get_embedding, EMBEDDING_MODEL
+            vec = get_embedding(content)
+            if vec is not None:
+                db.store_embedding(
+                    source_type="memory",
+                    source_id=str(entry_id),
+                    content=content,
+                    embedding=vec,
+                    model=EMBEDDING_MODEL,
+                )
+        except Exception as e:
+            logging.debug("Failed to embed cold memory entry %s: %s", entry_id, e)
 
     def _cold_success_response(self, target: str,
                                message: str = None) -> Dict[str, Any]:
@@ -754,7 +809,7 @@ MEMORY_SCHEMA = {
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "HOT/COLD MEMORY:\n"
-        "- Hot memory (add/replace/remove): injected into every turn, limited capacity (~2200+1375 chars). "
+        "- Hot memory (add/replace/remove): injected into every turn, limited capacity (~4400+2750 chars). "
         "Keep only high-value, frequently-needed facts here.\n"
         "- Cold memory (search/archive/promote): unlimited archival storage with FTS5 search. "
         "Use 'archive' to move low-priority entries from hot to cold. "

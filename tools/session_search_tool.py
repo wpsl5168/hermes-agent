@@ -2,17 +2,15 @@
 """
 Session Search Tool - Long-Term Conversation Recall
 
-Searches past session transcripts in SQLite via FTS5, then summarizes the top
-matching sessions using a cheap/fast model (same pattern as web_extract).
-Returns focused summaries of past conversations rather than raw transcripts,
-keeping the main model's context window clean.
+Hybrid FTS5 + vector search with pre-generated summary preference.
 
 Flow:
-  1. FTS5 search finds matching messages ranked by relevance
-  2. Groups by session, takes the top N unique sessions (default 3)
-  3. Loads each session's conversation, truncates to ~100k chars centered on matches
-  4. Sends to Gemini Flash with a focused summarization prompt
-  5. Returns per-session summaries with metadata
+  1. FTS5 keyword search finds matching messages ranked by relevance
+  2. Vector similarity search (sqlite-vec) finds semantically related sessions
+  3. Merge + deduplicate results from both paths
+  4. For each matched session, prefer pre-generated summary (from auto_summary)
+  5. Only fall back to real-time LLM summarization when no summary exists
+  6. Returns per-session summaries with metadata
 """
 
 import asyncio
@@ -304,13 +302,14 @@ def session_search(
     """
     Search past sessions and return focused summaries of matching conversations.
 
-    Uses FTS5 to find matches, then summarizes the top sessions with Gemini Flash.
+    Hybrid search: FTS5 keyword matching + sqlite-vec vector similarity.
+    Prefers pre-generated summaries over real-time LLM calls for speed.
     The current session is excluded from results since the agent already has that context.
     """
     if db is None:
         return tool_error("Session database not available.", success=False)
 
-    limit = min(limit, 5)  # Cap at 5 sessions to avoid excessive LLM calls
+    limit = min(limit, 5)  # Cap at 5 sessions
 
     # Recent sessions mode: when query is empty, return metadata for recent sessions.
     # No LLM calls — just DB queries for titles, previews, timestamps.
@@ -325,26 +324,7 @@ def session_search(
         if role_filter and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
-        # FTS5 search -- get matches ranked by relevance
-        raw_results = db.search_messages(
-            query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=50,  # Get more matches to find unique sessions
-            offset=0,
-        )
-
-        if not raw_results:
-            return json.dumps({
-                "success": True,
-                "query": query,
-                "results": [],
-                "count": 0,
-                "message": "No matching sessions found.",
-            }, ensure_ascii=False)
-
-        # Resolve child sessions to their parent — delegation stores detailed
-        # content in child sessions, but the user's conversation is the parent.
+        # Resolve current session lineage
         def _resolve_to_parent(session_id: str) -> str:
             """Walk delegation chain to find the root parent session ID."""
             visited = set()
@@ -374,105 +354,166 @@ def session_search(
             _resolve_to_parent(current_session_id) if current_session_id else None
         )
 
-        # Group by resolved (parent) session_id, dedup, skip the current
-        # session lineage. Compression and delegation create child sessions
-        # that still belong to the same active conversation.
-        seen_sessions = {}
-        for result in raw_results:
-            raw_sid = result["session_id"]
-            resolved_sid = _resolve_to_parent(raw_sid)
-            # Skip the current session lineage — the agent already has that
-            # context, even if older turns live in parent fragments.
+        def _is_current_session(raw_sid: str, resolved_sid: str) -> bool:
+            """Check if a session belongs to the current session lineage."""
             if current_lineage_root and resolved_sid == current_lineage_root:
-                continue
+                return True
             if current_session_id and raw_sid == current_session_id:
-                continue
-            if resolved_sid not in seen_sessions:
-                result = dict(result)
-                result["session_id"] = resolved_sid
-                seen_sessions[resolved_sid] = result
-            if len(seen_sessions) >= limit:
-                break
+                return True
+            return False
 
-        # Prepare all sessions for parallel summarization
-        tasks = []
-        for session_id, match_info in seen_sessions.items():
-            try:
-                messages = db.get_messages_as_conversation(session_id)
-                if not messages:
-                    continue
-                session_meta = db.get_session(session_id) or {}
-                conversation_text = _format_conversation(messages)
-                conversation_text = _truncate_around_matches(conversation_text, query)
-                tasks.append((session_id, match_info, conversation_text, session_meta))
-            except Exception as e:
-                logging.warning(
-                    "Failed to prepare session %s: %s",
-                    session_id,
-                    e,
-                    exc_info=True,
-                )
-
-        # Summarize all sessions in parallel
-        async def _summarize_all() -> List[Union[str, Exception]]:
-            """Summarize all sessions in parallel."""
-            coros = [
-                _summarize_session(text, query, meta)
-                for _, _, text, meta in tasks
-            ]
-            return await asyncio.gather(*coros, return_exceptions=True)
-
+        # ── Path 1: FTS5 keyword search ──────────────────────────────────
+        fts_session_ids = {}  # session_id -> match_info dict
         try:
-            # Use _run_async() which properly manages event loops across
-            # CLI, gateway, and worker-thread contexts.  The previous
-            # pattern (asyncio.run() in a ThreadPoolExecutor) created a
-            # disposable event loop that conflicted with cached
-            # AsyncOpenAI/httpx clients bound to a different loop,
-            # causing deadlocks in gateway mode (#2681).
-            from model_tools import _run_async
-            results = _run_async(_summarize_all())
-        except concurrent.futures.TimeoutError:
-            logging.warning(
-                "Session summarization timed out after 60 seconds",
-                exc_info=True,
+            raw_results = db.search_messages(
+                query=query,
+                role_filter=role_list,
+                exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+                limit=50,
+                offset=0,
             )
+            for result in raw_results:
+                raw_sid = result["session_id"]
+                resolved_sid = _resolve_to_parent(raw_sid)
+                if _is_current_session(raw_sid, resolved_sid):
+                    continue
+                if resolved_sid not in fts_session_ids:
+                    result = dict(result)
+                    result["session_id"] = resolved_sid
+                    result["_match_source"] = "fts"
+                    fts_session_ids[resolved_sid] = result
+                if len(fts_session_ids) >= limit * 2:  # over-fetch for merge
+                    break
+        except Exception as e:
+            logging.warning("FTS5 search failed (falling through): %s", e)
+
+        # ── Path 2: Vector similarity search ─────────────────────────────
+        vec_session_ids = {}  # session_id -> {distance, source_id, ...}
+        try:
+            if getattr(db, "_vec_available", False):
+                from agent.embedding_client import get_embedding
+                query_vec = get_embedding(query)
+                if query_vec is not None:
+                    vec_results = db.search_embeddings(
+                        query_vec, source_type="session", limit=limit * 3,
+                    )
+                    for vr in vec_results:
+                        sid = vr["source_id"]
+                        resolved_sid = _resolve_to_parent(sid)
+                        if _is_current_session(sid, resolved_sid):
+                            continue
+                        if resolved_sid not in vec_session_ids:
+                            vec_session_ids[resolved_sid] = {
+                                "session_id": resolved_sid,
+                                "distance": vr["distance"],
+                                "_match_source": "vec",
+                            }
+                        if len(vec_session_ids) >= limit * 2:
+                            break
+        except Exception as e:
+            logging.debug("Vector search skipped: %s", e)
+
+        # ── Merge results ────────────────────────────────────────────────
+        # Priority: FTS hits first (exact keyword matches are more intentional),
+        # then vector hits that aren't already in FTS results.
+        merged_ids = list(fts_session_ids.keys())
+        for sid in vec_session_ids:
+            if sid not in fts_session_ids:
+                merged_ids.append(sid)
+        merged_ids = merged_ids[:limit]
+
+        if not merged_ids:
             return json.dumps({
-                "success": False,
-                "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
+                "success": True,
+                "query": query,
+                "results": [],
+                "count": 0,
+                "sessions_searched": 0,
+                "message": "No matching sessions found.",
             }, ensure_ascii=False)
 
+        # ── Build results: prefer pre-generated summaries ────────────────
+        sessions_needing_llm = []  # (session_id, match_info, conversation_text, session_meta)
         summaries = []
-        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
-            if isinstance(result, Exception):
-                logging.warning(
-                    "Failed to summarize session %s: %s",
-                    session_id, result, exc_info=True,
-                )
-                result = None
 
-            entry = {
-                "session_id": session_id,
-                "when": _format_timestamp(match_info.get("session_started")),
-                "source": match_info.get("source", "unknown"),
-                "model": match_info.get("model"),
-            }
+        for session_id in merged_ids:
+            try:
+                session_meta = db.get_session(session_id) or {}
+                match_source = "fts+vec" if (session_id in fts_session_ids and session_id in vec_session_ids) else \
+                               "fts" if session_id in fts_session_ids else "vec"
+                match_info = fts_session_ids.get(session_id) or vec_session_ids.get(session_id, {})
 
-            if result:
-                entry["summary"] = result
-            else:
-                # Fallback: raw preview so matched sessions aren't silently
-                # dropped when the summarizer is unavailable (fixes #3409).
-                preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
-                entry["summary"] = f"[Raw preview — summarization unavailable]\n{preview}"
+                entry = {
+                    "session_id": session_id,
+                    "when": _format_timestamp(
+                        match_info.get("session_started") or session_meta.get("started_at")
+                    ),
+                    "source": match_info.get("source") or session_meta.get("source", "unknown"),
+                    "model": match_info.get("model") or session_meta.get("model"),
+                    "match": match_source,
+                }
 
-            summaries.append(entry)
+                # Check for pre-generated summary first
+                existing_summary = session_meta.get("summary")
+                if existing_summary and existing_summary.strip():
+                    entry["summary"] = existing_summary.strip()
+                    summaries.append(entry)
+                else:
+                    # Need LLM summarization — queue it
+                    messages = db.get_messages_as_conversation(session_id)
+                    if messages:
+                        conversation_text = _format_conversation(messages)
+                        conversation_text = _truncate_around_matches(conversation_text, query)
+                        sessions_needing_llm.append((session_id, entry, conversation_text, session_meta))
+                    else:
+                        entry["summary"] = "(Empty session — no messages found)"
+                        summaries.append(entry)
+            except Exception as e:
+                logging.warning("Failed to prepare session %s: %s", session_id, e, exc_info=True)
+
+        # ── LLM summarization for sessions without pre-generated summaries ──
+        if sessions_needing_llm:
+            async def _summarize_all() -> List[Union[str, Exception]]:
+                coros = [
+                    _summarize_session(text, query, meta)
+                    for _, _, text, meta in sessions_needing_llm
+                ]
+                return await asyncio.gather(*coros, return_exceptions=True)
+
+            try:
+                from model_tools import _run_async
+                llm_results = _run_async(_summarize_all())
+            except concurrent.futures.TimeoutError:
+                logging.warning("Session summarization timed out")
+                llm_results = [None] * len(sessions_needing_llm)
+
+            for (session_id, entry, conversation_text, _), result in zip(sessions_needing_llm, llm_results):
+                if isinstance(result, Exception):
+                    logging.warning("Failed to summarize session %s: %s", session_id, result)
+                    result = None
+
+                if result:
+                    entry["summary"] = result
+                else:
+                    preview = (conversation_text[:500] + "\n…[truncated]") if conversation_text else "No preview available."
+                    entry["summary"] = f"[Raw preview — summarization unavailable]\n{preview}"
+                summaries.append(entry)
+
+        # Sort: sessions with proper summaries first, then by timestamp
+        summaries.sort(key=lambda s: (
+            0 if not s.get("summary", "").startswith("[Raw preview") else 1,
+        ))
 
         return json.dumps({
             "success": True,
             "query": query,
             "results": summaries,
             "count": len(summaries),
-            "sessions_searched": len(seen_sessions),
+            "sessions_searched": len(merged_ids),
+            "search_paths": {
+                "fts_hits": len(fts_session_ids),
+                "vec_hits": len(vec_session_ids),
+            },
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -499,7 +540,8 @@ SESSION_SEARCH_SCHEMA = {
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
         "Start here when the user asks what were we working on or what did we do recently.\n"
         "2. Keyword search (with query): Search for specific topics across all past sessions. "
-        "Returns LLM-generated summaries of matching sessions.\n\n"
+        "Returns summaries of matching sessions (prefers cached summaries for speed, "
+        "falls back to LLM summarization when needed).\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
         "- The user asks about a topic you worked on before but don't have in current context\n"
