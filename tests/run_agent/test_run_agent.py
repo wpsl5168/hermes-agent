@@ -1781,6 +1781,67 @@ class TestConcurrentToolExecution:
 
         assert json.loads(result) == {"error": "Blocked"}
 
+    # Regression: post_tool_call hook for built-in tools (#12922)
+    @pytest.mark.parametrize("tool_name,tool_args,patch_target,patch_kwargs", [
+        ("todo", {"todos": []}, "tools.todo_tool.todo_tool", {"return_value": '{"ok":true}'}),
+        ("memory", {"action": "add", "content": "x"}, "tools.memory_tool.memory_tool", {"return_value": '{"ok":true}'}),
+        ("clarify", {"question": "?"}, "tools.clarify_tool.clarify_tool", {"return_value": '{"ok":true}'}),
+    ])
+    def test_invoke_tool_fires_post_tool_call_hook_for_builtin_tools(
+        self, agent, tool_name, tool_args, patch_target, patch_kwargs,
+    ):
+        """Built-in tools (todo/memory/clarify/...) must fire post_tool_call hook.
+
+        Regression for NousResearch/hermes-agent#12922: previously these tools
+        bypassed the hook because they short-circuit handle_function_call.
+        """
+        with (
+            patch(patch_target, **patch_kwargs),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke,
+        ):
+            result = agent._invoke_tool(tool_name, tool_args, "task-1", tool_call_id="call-xyz")
+
+        assert result == '{"ok":true}'
+        post_calls = [c for c in mock_invoke.call_args_list if c.args and c.args[0] == "post_tool_call"]
+        assert len(post_calls) == 1, (
+            f"Expected exactly one post_tool_call hook for {tool_name}, "
+            f"got {len(post_calls)}. All invoke_hook calls: {mock_invoke.call_args_list}"
+        )
+        kwargs = post_calls[0].kwargs
+        assert kwargs["tool_name"] == tool_name
+        assert kwargs["args"] == tool_args
+        assert kwargs["result"] == '{"ok":true}'
+        assert kwargs["tool_call_id"] == "call-xyz"
+
+    def test_invoke_tool_session_search_no_db_still_fires_post_hook(self, agent):
+        """session_search with missing DB returns error JSON but still fires hook."""
+        agent._session_db = None
+        with patch("hermes_cli.plugins.invoke_hook") as mock_invoke:
+            result = agent._invoke_tool("session_search", {"query": "x"}, "task-1")
+
+        parsed = json.loads(result)
+        assert parsed["success"] is False
+        post_calls = [c for c in mock_invoke.call_args_list if c.args and c.args[0] == "post_tool_call"]
+        assert len(post_calls) == 1
+        assert post_calls[0].kwargs["tool_name"] == "session_search"
+
+    def test_invoke_tool_routes_registry_tools_only_once(self, agent):
+        """Registry-routed tools must NOT fire post_tool_call twice.
+
+        handle_function_call already fires the hook internally; _invoke_tool
+        delegates to it via the else branch and must not duplicate.
+        """
+        with (
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke,
+            patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
+        ):
+            agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+
+        post_calls = [c for c in mock_invoke.call_args_list if c.args and c.args[0] == "post_tool_call"]
+        assert len(post_calls) == 1, (
+            f"Expected exactly one post_tool_call for web_search, got {len(post_calls)}"
+        )
+
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
         tool_call = _mock_tool_call(name="write_file",
