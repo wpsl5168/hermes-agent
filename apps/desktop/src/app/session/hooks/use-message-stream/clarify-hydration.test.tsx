@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { clearClarifyRequest } from '@/store/clarify'
+import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
+import { onScrollToBottomRequest } from '@/store/thread-scroll'
 import type { RpcEvent } from '@/types/hermes'
 
 import { useMessageStream } from './index'
@@ -19,6 +20,9 @@ const SID = 'session-1'
 
 let handleEvent: ((event: RpcEvent) => void) | null = null
 let stateRef: MutableRefObject<Map<string, ClientSessionState>> | null = null
+let stopScrollListener: (() => void) | null = null
+
+const scrollToBottom = vi.fn()
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(SID)
@@ -71,11 +75,15 @@ describe('clarify.request stream hydration', () => {
     handleEvent = null
     stateRef = null
     clearClarifyRequest()
+    scrollToBottom.mockClear()
+    stopScrollListener = onScrollToBottomRequest(scrollToBottom)
   })
 
   afterEach(() => {
     cleanup()
     clearClarifyRequest()
+    stopScrollListener?.()
+    stopScrollListener = null
     vi.restoreAllMocks()
   })
 
@@ -90,6 +98,54 @@ describe('clarify.request stream hydration', () => {
     expect(parts[0].type === 'tool-call' && parts[0].args).toMatchObject({
       choices: ['yes', 'no'],
       question: 'Ship it?'
+    })
+  })
+
+  it('reveals a clarify prompt raised by the active session', async () => {
+    await mountStream()
+
+    clarifyRequest({ choices: ['yes', 'no'], question: 'Ship it?', request_id: 'req-reveal' })
+
+    expect(scrollToBottom).toHaveBeenCalledOnce()
+  })
+
+  it('does not move the active thread for a background session clarify', async () => {
+    await mountStream()
+
+    act(() =>
+      handleEvent!({
+        payload: { choices: ['yes', 'no'], question: 'Ship it?', request_id: 'req-background' },
+        session_id: 'session-background',
+        type: 'clarify.request'
+      })
+    )
+
+    expect(scrollToBottom).not.toHaveBeenCalled()
+  })
+
+  it('preserves multi-select through the store and hydrated tool row', async () => {
+    await mountStream()
+
+    clarifyRequest({
+      choices: ['read', 'write'],
+      multi_select: true,
+      question: 'Which permissions?',
+      request_id: 'req-multi'
+    })
+
+    expect($clarifyRequests.get()[SID]?.multiSelect).toBe(true)
+
+    const part = clarifyParts()[0]
+    expect(part?.type).toBe('tool-call')
+
+    if (part?.type !== 'tool-call') {
+      throw new Error('Expected a hydrated clarify tool call')
+    }
+
+    expect(part.args).toMatchObject({
+      choices: ['read', 'write'],
+      multi_select: true,
+      question: 'Which permissions?'
     })
   })
 
@@ -110,6 +166,47 @@ describe('clarify.request stream hydration', () => {
 
     clarifyRequest({ choices: ['a'], question: 'Pick', request_id: 'req-3' })
     toolStart({ args: { choices: ['a'], question: 'Pick' }, name: 'clarify', tool_id: 'call-xyz' })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('merges a BATCH tool.start row with its clarify.request (no top-level question)', async () => {
+    await mountStream()
+
+    // The batch shape: tool args carry `questions`, no top-level `question`.
+    // The correlation key must come from the question list, or the two ids
+    // mount two cards (the duplicate seen in the field).
+    toolStart({
+      args: { questions: [{ question: 'Drink?' }, { question: 'Productive when?' }] },
+      name: 'clarify',
+      tool_id: 'call-batch'
+    })
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-batch'
+    })
+
+    expect(clarifyParts()).toHaveLength(1)
+  })
+
+  it('does not duplicate when the batch clarify.request arrives before tool.start', async () => {
+    await mountStream()
+
+    clarifyRequest({
+      questions: [
+        { qid: 'q0', question: 'Drink?' },
+        { qid: 'q1', question: 'Productive when?' }
+      ],
+      request_id: 'req-batch-2'
+    })
+    toolStart({
+      args: { questions: [{ question: 'Drink?' }, { question: 'Productive when?' }] },
+      name: 'clarify',
+      tool_id: 'call-batch-2'
+    })
 
     expect(clarifyParts()).toHaveLength(1)
   })
