@@ -1,3 +1,7 @@
+// Side-effect import: watches the turn edge so the overlay keeps a pulse while
+// the model reasons. Lives here because the pane is what makes it reachable.
+import './preview-mind'
+
 import { useStore } from '@nanostores/react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -14,7 +18,7 @@ import { reachablePreviewUrl } from '@/lib/preview-reach'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $previewServerRestart, failPreviewServerRestart, type PreviewTarget } from '@/store/preview'
+import { $previewServerRestart, failPreviewServerRestart, noteBrowserPage, type PreviewTarget } from '@/store/preview'
 
 import { ArtifactPreview } from './preview-artifact'
 import { PreviewBrowserBar } from './preview-browser-bar'
@@ -28,9 +32,10 @@ import {
 import { type ConsoleEntry } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
+import { type PreviewInputEvent, registerPreviewInput } from './preview-input'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
-import { registerPreviewTourRunner } from './preview-tour-runner'
+import { registerPreviewScriptRunner } from './preview-script-runner'
 
 type PreviewWebview = HTMLElement & {
   canGoBack?: () => boolean
@@ -53,6 +58,7 @@ type PreviewWebview = HTMLElement & {
   reloadIgnoringCache?: () => void
   replaceMisspelling?: (word: string) => void
   selectAll?: () => void
+  sendInputEvent?: (event: PreviewInputEvent) => void
 }
 
 /** The raw Chromium params riding the webview tag's `context-menu` event. */
@@ -379,6 +385,10 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const navigateTo = useCallback(
     (url: string) => {
       setLoadError(null)
+      // The reach probe below is a round-trip of its own, and `did-start-loading`
+      // can't fire until it resolves — so own the loading state from the moment
+      // we accept the address, or the bar sits idle over a request in flight.
+      setLoading(true)
       // Typed addresses get the same loopback reach as agent-opened ones — on a
       // remote gateway `localhost:5173` is usually the dev server the user is
       // there to look at, not something on their own laptop.
@@ -455,15 +465,15 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     })
   }, [isWebPreview, tabId])
 
-  // Publish the TOUR runner for this tab (the tour tool, surface='preview'):
-  // runs injected driver.js actions inside the guest page so the agent can
-  // give guided walkthroughs of whatever web app is open here.
+  // Publish the SCRIPT runner for this tab: the one channel into the guest
+  // page, shared by the tour tool (injected driver.js walkthroughs) and the
+  // drive_preview tool (clicking, typing, scrolling the page the user sees).
   useEffect(() => {
     if (!isWebPreview || !tabId) {
       return
     }
 
-    return registerPreviewTourRunner(tabId, async code => {
+    return registerPreviewScriptRunner(tabId, async code => {
       const webview = webviewRef.current
 
       if (!webview?.executeJavaScript) {
@@ -473,6 +483,32 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       return webview.executeJavaScript(code)
     })
   }, [isWebPreview, tabId])
+
+  // Publish the INPUT channel for this tab. Same idea as the script runner, but
+  // it carries real Chromium input rather than script — the agent's clicks and
+  // keystrokes arrive as trusted events, so the page hovers, focuses and reacts
+  // exactly as it would under a human hand.
+  useEffect(() => {
+    if (!isWebPreview || isRemoteHtml || !tabId) {
+      return
+    }
+
+    return registerPreviewInput(tabId, {
+      focus: () => webviewRef.current?.focus?.(),
+      send: event => {
+        const webview = webviewRef.current
+
+        // Never optional-chain this call away: a missing method would make every
+        // agent click a silent no-op that still reports success, because the
+        // overlay and the read-back both run on the separate script channel.
+        if (typeof webview?.sendInputEvent !== 'function') {
+          throw new Error('preview webview cannot take input events')
+        }
+
+        webview.sendInputEvent(event)
+      }
+    })
+  }, [isRemoteHtml, isWebPreview, tabId])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -714,6 +750,18 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     const syncHistory = () =>
       setHistory({ back: webview.canGoBack?.() ?? false, forward: webview.canGoForward?.() ?? false })
 
+    // Tell the strip what this Browser is showing, so its tab renames itself
+    // like a tab anywhere else. Deliberately NOT written back into the tab's
+    // target: the guest is built from `target.url`, so that would rebuild the
+    // webview mid-navigation and throw away the history.
+    const notePage = () => {
+      if (target.kind !== 'url' || !tabId) {
+        return
+      }
+
+      noteBrowserPage(tabId, { title: webview.getTitle?.() ?? '', url: webview.getURL?.() || target.url })
+    }
+
     const onNavigate = (event: Event) => {
       const detail = event as Event & { url?: string }
 
@@ -721,6 +769,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         setLoadError(null)
         setCurrentUrl(detail.url)
       }
+
+      notePage()
 
       // Ask the webview rather than counting navigations: the guest page can
       // move itself (redirects, history.pushState, a link into a new document),
@@ -762,6 +812,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       // cancelled navigation) still settles the history — resync so the
       // buttons can't be left stale.
       syncHistory()
+      notePage()
     }
 
     // The WEBVIEW is the source of truth for DevTools, not our click handler:
@@ -853,6 +904,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     webview.addEventListener('did-navigate-in-page', onNavigate)
     webview.addEventListener('did-start-loading', onStart)
     webview.addEventListener('did-stop-loading', onStop)
+    // SPAs title themselves long after the load settles, and a route change
+    // renames the page without navigating at all.
+    webview.addEventListener('page-title-updated', notePage)
     host.appendChild(webview)
     webviewRef.current = webview
 
@@ -866,9 +920,10 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webview.removeEventListener('did-navigate-in-page', onNavigate)
       webview.removeEventListener('did-start-loading', onStart)
       webview.removeEventListener('did-stop-loading', onStop)
+      webview.removeEventListener('page-title-updated', notePage)
       webview.remove()
     }
-  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, target.url])
+  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, tabId, target.kind, target.url])
 
   return (
     <aside
