@@ -44,6 +44,7 @@ The center of the app. You get:
 - **The same conversation history** as every other Hermes surface — sessions started here resume in the CLI/TUI and vice versa.
 - **Drag-and-drop files** anywhere in the chat area to attach them to your next message.
 - **A right-hand preview rail** — render web pages, files, and tool outputs side by side while you keep chatting.
+- **Comment mode in the in-app browser** — click **Annotate** in the preview browser bar, then click any element (or drag a box) on the live page and type a note; each saved comment stays as a numbered pin on the page. Saving a pin never sends a turn — when you're done, **Add N comments** attaches a cropped screenshot per pin and a short prompt naming each comment to the composer, and you still hit send yourself. Pin numbers hold steady if you delete one, and switching chats clears the stack.
 - **Composer history and queue editing** — press the up/down arrow keys in an empty composer to recall and reuse previous prompts, and edit messages you've queued up before they're sent. Pressing Stop (or Esc) while turns are queued pauses the queue and expands it above the composer; resume it from there, or send, edit, and delete individual entries.
 - **A conversation timeline rail** — long chats get a slim rail of markers along the edge of the transcript, one per prompt. Hover it to pop open the list of prompts, click one to jump straight to that point in the conversation. (It appears once the chat has a handful of turns.)
 - **Find in page** — press **Cmd/Ctrl+F** to open a find bar that searches the rendered chat transcript. Enter / Shift+Enter (or Cmd/Ctrl+G / Cmd/Ctrl+Shift+G while the bar is open) step through matches; Esc closes it.
@@ -156,7 +157,7 @@ That bridges to `ELECTRON_OZONE_PLATFORM_HINT` at launch (an explicit env var st
 
 Manage providers, models, tools, and credentials from a real UI instead of editing YAML. First-run onboarding gets you to your first message in seconds. The settings panes cover providers/keys, model selection, toolset configuration, MCP servers, the gateway, and session management.
 
-- **Providers settings pane** — a dedicated place to manage inference providers, with an Accounts / API-keys UX for signing in and storing credentials per provider.
+- **Providers settings pane** — a dedicated place to manage inference providers, with an Accounts / API-keys UX for signing in and storing credentials per provider. Its **Local Models** view installs and manages an on-device llama.cpp runtime — see [Local Models](/user-guide/local-models).
 - **Every provider and model in the menus** — the GUI surfaces the full provider list and every model that `hermes model` knows about, so you pick from the same catalog the CLI sees rather than a curated subset.
 - **xAI Grok OAuth** — Grok is a first-class OAuth provider in the launcher; sign in through the browser flow like the other OAuth providers.
 - **Tool-backend installs from the GUI** — run a tool backend's post-setup install steps directly from the app instead of dropping to a terminal.
@@ -182,7 +183,7 @@ When you have two or more [profiles](./profiles.md), the config-backed settings 
 
 The app also surfaces the broader Hermes management surface so you don't have to drop to a terminal:
 
-- **Skills** — browse, install, and manage [skills](./features/skills.md).
+- **Skills** — browse, install, and manage [skills](./features/skills.md). The Skills tab lists your installed skills with enable/disable toggles, and below them the full built-in optional-skills catalog that ships with Hermes — each entry has a one-click **Install** button that flips the row into the installed list once it finishes.
 - **Memory graph (Star Map)** — type `/journey` (aliases `/learning`, `/memory-graph`) in chat to open an interactive constellation of learned skills and memories over time, with a playback scrubber. Nodes can be edited or deleted right from the panel (skills are archived, memories removed). See [Learning Journey](./features/memory.md#learning-journey-journey).
 - **Cron** — view and manage [scheduled jobs](../reference/cli-commands.md#hermes-cron).
 - **Profiles** — switch between [Hermes profiles](./profiles.md) (isolated config/skills/sessions).
@@ -250,7 +251,7 @@ chats decide who replies: [Bot Mode: A Roster of Agents](./bot-mode.md).
 - **Command palette** — press **Cmd+K** or **Cmd+P** (Ctrl+K / Ctrl+P on Windows/Linux) to jump to actions and navigate the app from the keyboard: open any page or settings section, jump to a session by title or id, switch model/theme/color mode, spawn a terminal, restart the gateway, update Hermes, and more.
 - **Rebindable shortcuts** — **Settings → Keyboard Shortcuts** (or **Cmd/Ctrl+/**) opens the shortcuts panel where you can remap almost every binding — profile switching, session navigation, view toggles, and any shortcuts contributed by desktop plugins. Duplicate assignments are flagged as conflicts. A few defaults worth knowing: **Cmd/Ctrl+N** new session, **Cmd/Ctrl+.** Command Center, **Cmd/Ctrl+,** Settings, **Cmd/Ctrl+Shift+F** search sessions, **Cmd/Ctrl+1–9** switch profiles, **Shift+X** toggle light/dark.
 - **Custom zoom shortcuts** — zoom the interface in half-step increments for finer control over text size.
-- **UI language switcher** — change the app's interface language in-app, including Simplified Chinese (zh-Hans).
+- **UI language switcher** — change the app's interface language in-app: English, Simplified Chinese (zh-Hans), Traditional Chinese (zh-Hant), Japanese, Arabic (RTL), and Russian.
 
 ### Sessions & profiles
 
@@ -540,20 +541,62 @@ macOS/Windows signing and notarization run automatically when the relevant crede
 
 ### macOS permissions and local rebuilds (TCC)
 
+**Silence every folder prompt with one switch.** macOS prompts per-category
+(Desktop, then Downloads, then Documents, ...) as Hermes touches each folder.
+A single **Full Disk Access** grant covers all of them, permanently — and
+with Hermes' stable signing identities it survives every update:
+
+1. System Settings → **Privacy & Security → Full Disk Access** (or run
+   `open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"`)
+2. Enable your terminal app — and **Hermes.app** if you use Desktop.
+3. Fully quit and relaunch them once.
+
+`hermes doctor` reports whether the current terminal context already has the
+grant, and `hermes setup` shows this tip on macOS when it doesn't.
+
 macOS remembers permission grants (Full Disk Access, Desktop/Downloads/Documents,
 Accessibility, Automation, microphone) against the app's *code-signing identity*,
 not its path. Locally built and self-updated apps are signed with a stable
-identifier-pinned ad-hoc signature, so grants persist across updates out of the
-box.
+identifier-pinned ad-hoc signature, so grants persist across updates.
+
+One-time note: grants made to builds *before* the identifier-pinned signing
+fix (PR #73681) carry the old cdhash-pinned requirement. macOS keeps showing the
+toggle as ON for those stale grants but still re-prompts, because the stored
+grant no longer matches the rebuilt binary — and the modern prompt has no Allow
+button, so it looks like there is nothing to re-check. If that happens, reset
+the stale grant once and re-grant:
+
+```bash
+tccutil reset ScreenCapture com.nousresearch.hermes   # repeat per service
+```
+
+then toggle the fresh entry ON in System Settings and fully quit & relaunch
+Hermes. Grants are stable from then on.
 
 For the strongest guarantee — a certificate-anchored identity, the same
 mechanism yabai/skhd users rely on — create a self-signed code-signing
-certificate once and tell Hermes to use it:
+certificate once and tell Hermes to use it. The one-shot command does
+everything (creates the certificate in your login keychain, grants `codesign`
+access, writes the config, and re-signs the packaged app):
+
+```bash
+hermes desktop --setup-tcc-identity
+```
+
+Or do it manually:
 
 1. Keychain Access → Certificate Assistant → **Create a Certificate…**
 2. Name: `Hermes Local Signing`, Identity Type: *Self-Signed Root*,
    Certificate Type: **Code Signing**.
-3. `hermes config set desktop.macos_signing_identity "Hermes Local Signing"`
+3. In Keychain Access, double-click the new certificate → **Trust** → set
+   **Code Signing** to *Always Trust* (an imported self-signed certificate is
+   not a valid signing identity until it is trusted for code signing —
+   `security find-identity -v -p codesigning` should list it afterwards).
+4. `hermes config set desktop.macos_signing_identity "Hermes Local Signing"`
+
+Use `--identity <name>` with the command to create/use a differently named
+certificate (default: `Hermes Local Signing`). The command is idempotent —
+re-run it after updates to re-point the config and re-sign the rebuilt app.
 
 The next update re-signs the rebuilt app with that certificate; every TCC grant
 survives. No Apple Developer account is required. Notarized release builds are

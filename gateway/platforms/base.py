@@ -62,6 +62,45 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 # delivered as a regular document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+
+
+def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k") -> "str | None":
+    """Best-effort ffmpeg transcode of any audio file to Ogg/Opus (voip-tuned).
+
+    The shared engine behind native voice-bubble delivery for platforms whose
+    voice channel only accepts Opus/OGG (Telegram sendVoice, Feishu opus
+    audio, Matrix MSC3245, WhatsApp voice notes). Returns the path of a NEW
+    temp ``.ogg`` file (caller owns cleanup), or ``None`` when ffmpeg is
+    missing or the conversion fails — callers keep their previous fallback
+    (document/attachment delivery). Blocking; call via ``asyncio.to_thread``
+    from async code.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+
+    ffmpeg = _shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+
+    fd, ogg_path = _tempfile.mkstemp(prefix="voice_transcode_", suffix=".ogg")
+    os.close(fd)
+    try:
+        result = _subprocess.run(
+            [ffmpeg, "-v", "error", "-y", "-i", str(path),
+             "-acodec", "libopus", "-ac", "1", "-b:a", bitrate, "-vbr", "on",
+             "-application", "voip", "-compression_level", "10", ogg_path],
+            capture_output=True, timeout=60, stdin=_subprocess.DEVNULL,
+        )
+        if result.returncode == 0 and os.path.getsize(ogg_path) > 0:
+            return ogg_path
+    except Exception:
+        logger.debug("voice transcode to Ogg/Opus failed for %s", path, exc_info=True)
+    try:
+        os.unlink(ogg_path)
+    except OSError:
+        pass
+    return None
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 # Delivery-time history is best-effort dedup metadata, not canonical state.
 # Keep this comfortably below the Discord heartbeat watchdog window and fail
@@ -184,6 +223,12 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
     if normalized_ext not in _AUDIO_EXTS:
         return False
     if _platform_name(platform) == "telegram":
+        if is_voice:
+            # Explicit [[audio_as_voice]] intent: ANY audio format routes to
+            # the voice sender — the adapter transcodes non-Opus input to
+            # Ogg/Opus on the fly (transcode_to_ogg_opus), so the intent no
+            # longer dead-ends into document delivery for .mp3/.wav/etc.
+            return True
         if normalized_ext in _TELEGRAM_VOICE_EXTS:
             return is_voice
         return normalized_ext in _TELEGRAM_AUDIO_ATTACHMENT_EXTS
@@ -1531,41 +1576,63 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
     return mounts
 
 
-def _docker_sandbox_dir_name(session_key: str = "") -> str:
-    """Host sandbox directory name for a session's persistent Docker container.
+def _docker_sandbox_dir_candidates(session_key: str = "") -> List[str]:
+    """Candidate host sandbox dir names for the delivering session, best first.
 
-    Mirrors ``_resolve_container_task_id(None)`` (tools/terminal_tool.py):
-    gateway sessions key their container ``session:<session_key>`` and
-    tools/environments/docker.py names the host directory after
-    :func:`sanitize_task_id_for_path` of that id. Contexts without a session
-    key share the historical ``default`` sandbox.
+    Mirrors ``_resolve_container_task_id`` (tools/terminal_tool.py). Persistent
+    Docker containers are PROFILE-scoped: the default profile uses the literal
+    ``default`` sandbox (shared with CLI), other profiles use
+    ``sanitize_task_id_for_path("profile:<name>")``. Legacy per-session
+    sandboxes created while commit a270c4ade's ungated session fallback was
+    live (``session:<session_key>``) are kept as a fallback candidate so
+    files produced in that window still deliver (self-heal, no migration).
 
     Takes the key explicitly because the delivery pipeline runs after
     ``_handle_message_with_agent`` cleared the turn's session contextvars
     (#93950) — an ambient lookup here would silently collapse onto
     ``default`` and miss the session's real sandbox.
     """
-    if not session_key:
-        return "default"
+    candidates: List[str] = []
     try:
-        from tools.environments.base import sanitize_task_id_for_path
-
-        return sanitize_task_id_for_path(f"session:{session_key}")
+        from tools.environments.path_utils import sanitize_task_id_for_path
     except Exception:
-        return "default"
+        return ["default"]
+    # Explicit trusted-profiles opt-in: one shared container identity.
+    shared = os.getenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
+    if shared:
+        candidates.append(sanitize_task_id_for_path(f"shared:{shared}"))
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = get_active_profile_name() or "default"
+    except Exception:
+        profile = "default"
+    if profile != "default":
+        candidates.append(sanitize_task_id_for_path(f"profile:{profile}"))
+    candidates.append("default")
+    if session_key:
+        # Bug-window legacy layout: per-session sandboxes.
+        candidates.append(sanitize_task_id_for_path(f"session:{session_key}"))
+    return candidates
 
 
-def _default_docker_workspace_host_root(session_key: str = "") -> Optional[Path]:
-    """Host path for this session's persistent ``/workspace`` mount."""
+def _default_docker_workspace_host_roots(session_key: str = "") -> List[Path]:
+    """Existing host-path candidates for the persistent ``/workspace`` mount.
+
+    Ordered best-first (active profile layout, then the legacy bug-window
+    per-session layout). The translator tries each until the requested file
+    actually resolves — the profile sandbox dir existing does not mean the
+    file lives there when it was produced in a legacy per-session container.
+    """
     if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
-        return None
+        return []
     if os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() not in {
         "1",
         "true",
         "yes",
         "on",
     }:
-        return None
+        return []
     # Explicit cwd mount takes over /workspace when enabled.
     if os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").strip().lower() in {
         "1",
@@ -1577,46 +1644,51 @@ def _default_docker_workspace_host_root(session_key: str = "") -> Optional[Path]
         try:
             host = Path(os.path.expanduser(cwd)).resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
-            return None
-        return host if host.is_dir() else None
+            return []
+        return [host] if host.is_dir() else []
     try:
         from tools.environments.base import get_sandbox_dir
 
-        root = (
-            get_sandbox_dir() / "docker" / _docker_sandbox_dir_name(session_key) / "workspace"
-        ).resolve(strict=False)
+        base = get_sandbox_dir() / "docker"
+        roots = []
+        for name in _docker_sandbox_dir_candidates(session_key):
+            cand = (base / name / "workspace").resolve(strict=False)
+            if cand.is_dir():
+                roots.append(cand)
     except Exception:
-        return None
-    return root if root.is_dir() else None
+        return []
+    return roots
 
 
-def _docker_persistent_home_host_root(session_key: str = "") -> Optional[Path]:
-    """Host path for this session's persistent ``/root`` home mount.
+def _docker_persistent_home_host_roots(session_key: str = "") -> List[Path]:
+    """Existing host-path candidates for the persistent ``/root`` home mount.
 
     Persistent containers bind ``<sandbox>/docker/<task>/home`` to ``/root``
     (tools/environments/docker.py), so an agent that writes ``/root/out.png``
-    produced a real host file the gateway couldn't find. The task directory
-    is derived from the delivering session's key so session-scoped sandboxes
-    resolve to the container that produced the file (#93950).
+    produced a real host file the gateway couldn't find. Ordered best-first:
+    the profile-scoped layout, then the legacy bug-window per-session layout.
     """
     if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
-        return None
+        return []
     if os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() not in {
         "1",
         "true",
         "yes",
         "on",
     }:
-        return None
+        return []
     try:
         from tools.environments.base import get_sandbox_dir
 
-        root = (
-            get_sandbox_dir() / "docker" / _docker_sandbox_dir_name(session_key) / "home"
-        ).resolve(strict=False)
+        base = get_sandbox_dir() / "docker"
+        roots = []
+        for name in _docker_sandbox_dir_candidates(session_key):
+            cand = (base / name / "home").resolve(strict=False)
+            if cand.is_dir():
+                roots.append(cand)
     except Exception:
-        return None
-    return root if root.is_dir() else None
+        return []
+    return roots
 
 
 def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
@@ -1685,15 +1757,16 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
 
     mounts = list(_parse_docker_volume_mounts())
     mounts.extend(_cache_dir_container_mounts())
-    # Synthetic /workspace mount for default persistent sandbox / cwd bind.
-    default_ws = _default_docker_workspace_host_root(session_key)
-    if default_ws is not None and not any(c.as_posix() == "/workspace" for _, c in mounts):
-        mounts.append((default_ws, Path("/workspace")))
-    # Synthetic /root mount for the persistent home bind. Cache mounts above
+    # Synthetic /workspace mounts for the persistent sandbox / cwd bind.
+    # Multiple candidates: profile-scoped layout first, then the legacy
+    # bug-window per-session layout — the file is tried against each.
+    if not any(c.as_posix() == "/workspace" for _, c in mounts):
+        for ws_root in _default_docker_workspace_host_roots(session_key):
+            mounts.append((ws_root, Path("/workspace")))
+    # Synthetic /root mounts for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
-    default_home = _docker_persistent_home_host_root(session_key)
-    if default_home is not None and not any(c.as_posix() == "/root" for _, c in mounts):
+    if not any(c.as_posix() == "/root" for _, c in mounts):
         # /root/.hermes/* that did NOT match a cache mount is the container's
         # credential/secret surface (.env, auth.json, ... are individually
         # bind-mounted from the real host stores). Translating those through
@@ -1701,33 +1774,36 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
         # host-side credential denylist prefixes — refuse instead so the
         # normal "container path doesn't exist on host" rejection applies.
         if not candidate.as_posix().startswith("/root/.hermes"):
-            mounts.append((default_home, Path("/root")))
+            for home_root in _docker_persistent_home_host_roots(session_key):
+                mounts.append((home_root, Path("/root")))
 
     if not mounts:
         _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved")
         return None
-    # Longest container-prefix match.
-    best: Optional[Tuple[Path, Path, int]] = None
+    # Longest container-prefix match; equal-length prefixes (the candidate
+    # sandbox layouts above) are tried in insertion order until one actually
+    # holds the file.
+    matched: List[Tuple[Path, Path, int]] = []
     candidate_posix = candidate.as_posix()
     for host_root, container_root in mounts:
         container_posix = container_root.as_posix().rstrip("/") or "/"
         if candidate_posix == container_posix or candidate_posix.startswith(container_posix + "/"):
-            score = len(container_posix)
-            if best is None or score > best[2]:
-                best = (host_root, container_root, score)
-    if best is None:
+            matched.append((host_root, container_root, len(container_posix)))
+    if not matched:
         _warn_unresolved_docker_media(candidate, session_key, "no mounted prefix matches")
         return None
-    host_root, container_root, _ = best
-    try:
-        relative = candidate.relative_to(container_root)
-        translated = (host_root / relative).resolve(strict=True)
-    except (OSError, RuntimeError, ValueError):
-        _warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox")
-        return None
-    if translated != host_root and not _path_is_within(translated, host_root):
-        return None
-    return translated
+    matched.sort(key=lambda m: -m[2])
+    for host_root, container_root, _score in matched:
+        try:
+            relative = candidate.relative_to(container_root)
+            translated = (host_root / relative).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if translated != host_root and not _path_is_within(translated, host_root):
+            continue
+        return translated
+    _warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox")
+    return None
 
 
 def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
@@ -2385,6 +2461,9 @@ class MessageEvent:
     # media_urls: local file paths (for vision tool access)
     media_urls: List[str] = field(default_factory=list)
     media_types: List[str] = field(default_factory=list)
+    # Per-attachment text-inlining contract. None/absent preserves the legacy
+    # assumption that text/* adapters already injected content into ``text``.
+    media_text_inlined: List[Optional[bool]] = field(default_factory=list)
     
     # Reply context
     reply_to_message_id: Optional[str] = None
@@ -2769,10 +2848,22 @@ def merge_pending_message_event(
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
         incoming_has_media = bool(event.media_urls)
+        incoming_inline_flags: List[Optional[bool]] = []
+        if incoming_has_media:
+            existing_inline_flags = list(getattr(existing, "media_text_inlined", []) or [])
+            existing_inline_flags.extend(
+                [None] * max(0, len(existing.media_urls) - len(existing_inline_flags))
+            )
+            incoming_inline_flags = list(getattr(event, "media_text_inlined", []) or [])
+            incoming_inline_flags.extend(
+                [None] * max(0, len(event.media_urls) - len(incoming_inline_flags))
+            )
+            existing.media_text_inlined = existing_inline_flags
 
         if existing_is_photo and incoming_is_photo:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
+            existing.media_text_inlined.extend(incoming_inline_flags)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
@@ -2782,6 +2873,7 @@ def merge_pending_message_event(
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+                existing.media_text_inlined.extend(incoming_inline_flags)
             if event.text:
                 if existing.text:
                     existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
@@ -3672,6 +3764,50 @@ class BasePlatformAdapter(ABC):
         release_scoped_lock(self._platform_lock_scope, identity)
         self._platform_lock_identity = None
 
+    def _wire_plugin_handlers(self, native: Any = None) -> None:
+        """Invoke plugin-registered native handler factories for this platform.
+
+        Plugins call ``ctx.register_platform_handler(<platform>, factory)``
+        at register() time; adapters call this from ``connect()`` once
+        their native client object exists (and, where dispatch order
+        matters, before their own handlers register). Each factory is
+        invoked with ``(native, adapter)``.
+
+        Args:
+            native: The platform's native client/app object to hand to
+                factories (PTB ``Application``, ``commands.Bot``,
+                ``AsyncApp``, aiohttp ``web.Application``, ...). Pass
+                ``None`` for adapters with no separate native object —
+                factories then work against the adapter handle alone.
+
+        Each factory is isolated so a misbehaving plugin can't prevent
+        the platform from connecting.
+        """
+        platform_name = getattr(self.platform, "value", str(self.platform))
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            factories = get_plugin_manager().get_platform_handler_factories(
+                platform_name
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "[%s] Could not load plugin handler factories: %s",
+                self.name, e,
+            )
+            return
+        for factory, plugin_name in factories:
+            try:
+                factory(native, self)
+                logger.info(
+                    "[%s] Wired native handlers from plugin '%s'",
+                    self.name, plugin_name,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[%s] Plugin '%s' handler factory raised: %s",
+                    self.name, plugin_name, exc, exc_info=True,
+                )
+
     @property
     def name(self) -> str:
         """Human-readable name for this adapter."""
@@ -3787,11 +3923,26 @@ class BasePlatformAdapter(ABC):
         registered via :meth:`set_authorization_check`. Returns ``None``
         when no check is registered (caller should treat as "trust unknown"
         and preserve legacy behaviour).
+
+        Only the literal booleans are propagated. A callback that returns
+        anything else is treated as "unknown" rather than coerced with
+        ``bool()``: callers that gate a credentialed side effect on an
+        explicit ``is True`` must not have a truthy non-boolean (a status
+        string, a sentinel object) silently promoted to an authorization.
         """
         if not user_id or self._authorization_check is None:
             return None
         try:
-            return bool(self._authorization_check(user_id, chat_type, chat_id))
+            result = self._authorization_check(user_id, chat_type, chat_id)
+            if result is True:
+                return True
+            if result is False:
+                return False
+            logger.warning(
+                "[%s] Authorization check returned %s for user %s; treating as unknown",
+                self.name, type(result).__name__, user_id,
+            )
+            return None
         except Exception:
             logger.warning(
                 "[%s] Authorization check raised for user %s; treating as unknown",
@@ -6177,7 +6328,7 @@ class BasePlatformAdapter(ABC):
                     return
 
                 # Other bypass commands (/approve, /deny, /status,
-                # /background, /restart) just need direct dispatch — they
+                # /bg, /restart) just need direct dispatch — they
                 # don't cancel the running task.
                 logger.debug(
                     "[%s] Command '/%s' bypassing active-session guard for %s",
@@ -6653,6 +6804,9 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    adapter_profile=getattr(
+                                        delivery_adapter, "_owner_profile", None
+                                    ),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
@@ -6675,11 +6829,41 @@ class BasePlatformAdapter(ABC):
                             if getattr(result, "success", False):
                                 await asyncio.to_thread(mark_delivered, _obligation_id)
                             else:
+                                _delivery_error = str(
+                                    getattr(result, "error", "") or ""
+                                )
                                 await asyncio.to_thread(
                                     mark_failed,
                                     _obligation_id,
-                                    str(getattr(result, "error", "") or ""),
+                                    _delivery_error,
                                 )
+                                # A replacement can finish reconnecting before
+                                # this in-flight failure reaches mark_failed. In
+                                # that ordering the watcher's sweep found no row.
+                                # Signal a second transactional sweep only when a
+                                # new live adapter is already installed; atomic
+                                # claiming makes concurrent signals idempotent.
+                                if _delivery_error == "send_path_degraded":
+                                    _live_adapter = self._final_delivery_adapter(
+                                        event.source
+                                    )
+                                    _runtime_redeliver = getattr(
+                                        getattr(self, "gateway_runner", None),
+                                        "_redeliver_failed_obligations_for_platform",
+                                        None,
+                                    )
+                                    if (
+                                        _live_adapter is not delivery_adapter
+                                        and callable(_runtime_redeliver)
+                                    ):
+                                        await _runtime_redeliver(
+                                            event.source.platform,
+                                            profile=getattr(
+                                                delivery_adapter,
+                                                "_owner_profile",
+                                                None,
+                                            ),
+                                        )
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True
@@ -6773,6 +6957,7 @@ class BasePlatformAdapter(ABC):
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
+                                is_voice=is_voice,
                             )
                         elif ext in _VIDEO_EXTS:
                             logger.info(

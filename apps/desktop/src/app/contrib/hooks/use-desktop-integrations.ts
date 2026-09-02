@@ -25,7 +25,7 @@ import {
 } from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isHudWindow, isSecondaryWindow } from '@/store/windows'
+import { isBrowserWindow, isHudWindow, isSecondaryWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
@@ -73,7 +73,12 @@ export function useDesktopIntegrations({
     // Background MCP health: HTTP/SSE servers only (never spawns stdio),
     // notifies on transitions into needs-auth/error with a Sign in action.
     startMcpHealthChecker()
-    const unsubscribe = window.hermesDesktop?.onOpenUpdatesRequested?.(() => openUpdatesWindow())
+    // The native "Check for Updates…" menu item lives in the app menu next to
+    // "About Hermes" — it is the OS-standard affordance for updating THIS app,
+    // so it always opens the client overlay. Inheriting the connection-mode
+    // default pointed a Mac at its remote Linux backend and left the app itself
+    // silently stale (#70266).
+    const unsubscribe = window.hermesDesktop?.onOpenUpdatesRequested?.(() => openUpdatesWindow('client'))
 
     return () => {
       unsubscribe?.()
@@ -97,7 +102,7 @@ export function useDesktopIntegrations({
   // This ref is a one-time lifecycle latch, not a mirror of reactive atom state.
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
-    if (!profileReady || isHudWindow()) {
+    if (!profileReady || isHudWindow() || isBrowserWindow()) {
       return
     }
 
@@ -332,7 +337,7 @@ export function useDesktopIntegrations({
 
   // Another window mutated the shared session list -> re-pull the sidebar.
   useEffect(() => {
-    if (isSecondaryWindow()) {
+    if (isSecondaryWindow() || isBrowserWindow()) {
       return
     }
 

@@ -1130,16 +1130,15 @@ import sys
 
 
 # Tool description for LLM
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
+TERMINAL_TOOL_DESCRIPTION = """Execute shell commands. The host OS, shell, and terminal backend are stated in your environment section — write commands for THAT platform. Filesystem, current working directory, and exported environment variables persist between calls.
 
-Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
-NEVER pipe a build/test command through tail/head/cat to shorten output (e.g. `cargo build | tail -20`): output is auto-truncated with the full text saved to a file, and the pipe makes exit_code report the LAST pipeline command's status (tail's 0), masking real failures. Run the command bare; the same applies to `cmd || echo failed`, which also masks the exit code.
+Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
-Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
-PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
+Working directory: use 'workdir' for per-command cwd; when a command changes the session cwd (cd, pushd), trust the result's "cwd" field instead of prefixing every command with 'cd'.
+PTY: pty=true + background=true for interactive CLIs (they hang without a terminal); drive them with process(action="write"/"submit"). Local backend only.
 """
 
 # Global state for environment lifecycle management
@@ -1203,13 +1202,11 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     max_age = lifetime * 2
 
     try:
-        from tools.environments.docker import (
-            reap_orphan_containers, _get_active_profile_name,
-        )
+        from tools.environments.docker import reap_orphan_containers, _container_identity
     except ImportError:
         return
     try:
-        profile = _get_active_profile_name()
+        profile = _container_identity(container_config.get("docker_shared_container_key", ""))
         removed = reap_orphan_containers(
             max_age_seconds=max_age, profile_filter=profile,
         )
@@ -1407,6 +1404,39 @@ def _docker_session_isolation_enabled() -> bool:
     return _session_isolation_enabled()
 
 
+def _docker_persistent_profile_scoped() -> bool:
+    """True when the persistent Docker container is shared per PROFILE.
+
+    The product contract for ``TERMINAL_ENV=docker`` +
+    ``container_persistent: true`` is ONE long-lived container per Hermes
+    profile, shared by every session of that profile (CLI, gateway chats,
+    WebUI). Commit a270c4ade added a session-key fallback to
+    :func:`_resolve_container_task_id` to stop cross-profile SSH environment
+    reuse, but the fallback wasn't backend-gated, so persistent Docker
+    silently fragmented into one container per gateway session (#93950 was
+    downstream damage from that). This predicate gates the resolver back to
+    profile scoping for exactly this backend/mode; SSH and other backends
+    keep the session-scoped cache key that fixed the original leak.
+    """
+    _ensure_terminal_env_bridged()
+    if os.getenv("TERMINAL_ENV", "local") != "docker":
+        return False
+    return os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"}
+
+
+def _current_session_profile() -> str:
+    """Return the active session's Hermes profile name, or "" when unset.
+
+    Same lookup discipline as :func:`_current_session_key`: the ContextVar
+    (bound per message by the gateway, per session by the WebUI streaming
+    layer) with the ``get_session_env`` os.environ fallback for CLI, cron,
+    and test processes.
+    """
+    from gateway.session_context import get_session_env
+
+    return get_session_env("HERMES_SESSION_PROFILE", "")
+
+
 _ISOLATION_OVERRIDE_KEYS = frozenset({
     "docker_image", "modal_image", "singularity_image",
     "daytona_image", "env_type",
@@ -1474,7 +1504,33 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     # would otherwise collapse to the shared "default" key (notably SSH).
     session_key = _current_session_key()
     if session_key:
+        # Persistent Docker is PROFILE-scoped by contract: one long-lived
+        # container shared by every session of the profile. Key it by profile
+        # (not session) so gateway chats, CLI, and WebUI all land in the same
+        # container and sandbox. The bare "profile:default" key stays literally
+        # "default" so CLI mode (no session key at all) and gateway sessions of
+        # the default profile share the SAME container — CLI's historical key
+        # IS the default profile's container.
+        if _docker_persistent_profile_scoped():
+            # Explicit opt-in: trusted profiles configuring the same
+            # terminal.docker_shared_container_key share ONE container/cache
+            # slot (and sandbox dir) regardless of profile name (#84671).
+            shared = os.getenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
+            if shared:
+                return f"shared:{shared}"
+            profile = _current_session_profile() or "default"
+            if profile == "default":
+                return "default"
+            return f"profile:{profile}"
         return f"session:{session_key}"
+    # CLI/no-session path: honour the shared-container opt-in here too, or a
+    # CLI run of a keyed profile would land in "default" while its gateway
+    # sessions land in "shared:<key>" — splitting the very container the
+    # setting exists to unify.
+    if _docker_persistent_profile_scoped():
+        shared = os.getenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip()
+        if shared:
+            return f"shared:{shared}"
     return "default"
 
 
@@ -1561,16 +1617,21 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
 
 
 def _safe_getcwd() -> str:
-    """Return the current working directory, tolerating a deleted CWD.
+    """Return the current working directory, tolerating a deleted or
+    permission-restricted CWD.
 
     ``os.getcwd()`` raises FileNotFoundError when the process's working
     directory has been removed out from under it (e.g. a scratch workspace
-    that was cleaned up mid-session). Fall back to TERMINAL_CWD, then the
-    user's home directory, so terminal setup never crashes on a stale CWD.
+    that was cleaned up mid-session). On macOS with TCC (Transparency,
+    Consent, and Control), it raises PermissionError (EPERM) when the CWD
+    is under a protected location (~/Documents, ~/Desktop, ~/Downloads)
+    and the calling process lacks Full Disk Access. Fall back to
+    TERMINAL_CWD, then the user's home directory, so terminal setup never
+    crashes on a stale or TCC-blocked CWD.
     """
     try:
         return os.getcwd()
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
@@ -1819,6 +1880,9 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_persist_across_processes": os.getenv(
             "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
         ).lower() in {"true", "1", "yes"},
+        "docker_shared_container_key": os.getenv(
+            "TERMINAL_DOCKER_SHARED_CONTAINER_KEY", ""
+        ).strip(),
         # Startup orphan reaper for hermes-tagged containers left behind by
         # crashed / SIGKILL'd previous processes that bypassed atexit.
         # Conservative: only sweeps Exited containers older than 2× the
@@ -1876,6 +1940,7 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "docker_shm_size": config.get("docker_shm_size", "1g"),
         "docker_network": config.get("docker_network", True),
         "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+        "docker_shared_container_key": config.get("docker_shared_container_key", ""),
         "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
     }
 
@@ -1951,6 +2016,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                 False if session_scoped
                 else cc.get("docker_persist_across_processes", True)
             ),
+            shared_container_key=cc.get("docker_shared_container_key", ""),
             shm_size=cc.get("docker_shm_size", "1g"),
         )
         # Marker read by is_persistent_env(): a session-scoped container
@@ -2761,6 +2827,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    _host_local: bool = False,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2808,13 +2875,18 @@ def terminal_tool(
 
         # Get configuration
         config = _get_env_config()
-        env_type = config["env_type"]
+        env_type = "local" if _host_local else config["env_type"]
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+        if _host_local:
+            # Hermes-owned control-plane children must run beside the current
+            # interpreter, never inside the model's configured Docker/SSH/etc.
+            # Keep their environment cache separate from the configured backend.
+            effective_task_id = f"host-local-{effective_task_id}"
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -3238,6 +3310,7 @@ def terminal_tool(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
+                        owner_task_id=task_id or effective_task_id,
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
@@ -3248,6 +3321,7 @@ def terminal_tool(
                         command=command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
+                        owner_task_id=task_id or effective_task_id,
                         session_key=session_key,
                     )
 
@@ -3565,8 +3639,16 @@ def terminal_tool(
             # the last command to FINISH left there — on a shared env, that is
             # another session's directory. Recording it silently re-homes this
             # session into a directory the user never opened.
-            if not workdir and (result or {}).get("cwd_observed"):
-                record_session_cwd(session_key, getattr(env, "cwd", None))
+            observed_cwd = None
+            if (result or {}).get("cwd_observed"):
+                # New/current environments return the CWD observed by THIS
+                # command. The env field is shared mutable compatibility state
+                # and may already belong to a concurrent command. Keep the
+                # fallback for third-party providers that only implement the
+                # older cwd_observed + env.cwd contract.
+                observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
+            if not workdir and observed_cwd:
+                record_session_cwd(session_key, observed_cwd)
 
             # Extract output
             output = result.get("output", "")
@@ -3694,7 +3776,7 @@ def terminal_tool(
             # and tells the model it moved to a directory another session
             # opened.
             try:
-                post_cwd = getattr(env, "cwd", None) if (result or {}).get("cwd_observed") else None
+                post_cwd = observed_cwd
                 if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
                     result_dict["cwd"] = str(post_cwd)
             except Exception:
@@ -4034,11 +4116,11 @@ TERMINAL_SCHEMA = {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to execute on the VM"
+                "description": "The shell command to execute"
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                "description": "Run in the background, returning a session_id. Pair with notify=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
                 "default": False
             },
             "timeout": {
@@ -4052,19 +4134,19 @@ TERMINAL_SCHEMA = {
             },
             "pty": {
                 "type": "boolean",
-                "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
+                "description": "With background=true: run in a pseudo-terminal for interactive CLI tools (Codex, Claude Code, Python REPL). Local backend only. Default: false.",
                 "default": False
             },
-            "notify_on_complete": {
-                "type": "boolean",
-                "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
-                "default": False
-            },
-            "watch_patterns": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s, capped at a small number of matches over the process's lifetime; over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
+            "notify": {
+                "description": "With background=true: notify=true fires exactly one notification when the process exits (the right choice for nearly every bounded task — builds, tests, deploys). notify=['pattern', ...] instead notifies when a line matches a pattern — ONLY for one-shot readiness signals on processes that never exit (e.g. ['Application startup complete']); rate-limited and auto-disabled if it over-fires. Omit for silent daemons.",
+                "anyOf": [
+                    {"type": "boolean"},
+                    {"type": "array", "items": {"type": "string"}}
+                ]
             }
+            # Legacy aliases (unadvertised, still accepted): notify_on_complete
+            # (bool) and watch_patterns (list). notify=true|[...] maps onto
+            # them in the dispatch wrapper; explicit notify wins on conflict.
         },
         "required": ["command"]
     }
@@ -4083,6 +4165,40 @@ def _handle_terminal(args, **kw):
             "command in 'command'. Use execute_code(code=...) for Python; "
             "for shell, retry as terminal(command=...)."
         )
+    # `notify` is the advertised interface: true → notify_on_complete,
+    # ['pat', ...] → watch_patterns. The legacy args remain accepted
+    # (old transcripts, internal callers); explicit `notify` wins.
+    notify = args.get("notify")
+    notify_on_complete = args.get("notify_on_complete", False)
+    watch_patterns = args.get("watch_patterns")
+    # Background-only modifiers on a foreground call were silently ignored;
+    # fail with the corrected call instead (poka-yoke, no schema cost).
+    if not args.get("background", False):
+        if notify or watch_patterns or notify_on_complete:
+            return tool_error(
+                "notify only applies to background commands (foreground "
+                "results return directly). Either drop notify, or run as "
+                "terminal(command=..., background=true, notify=...)."
+            )
+        if args.get("pty", False):
+            return tool_error(
+                "pty requires background=true (a PTY session is interacted "
+                "with via process(action='write'/'submit'), which needs a "
+                "tracked background process). Retry as terminal(command=..., "
+                "background=true, pty=true)."
+            )
+    if notify is not None:
+        if isinstance(notify, bool):
+            notify_on_complete = notify
+            watch_patterns = None
+        elif isinstance(notify, list):
+            watch_patterns = notify
+            notify_on_complete = False
+        else:
+            return tool_error(
+                "notify must be true/false (notify on exit) or a list of "
+                "strings (notify on output pattern match)."
+            )
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -4091,8 +4207,8 @@ def _handle_terminal(args, **kw):
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
-        watch_patterns=args.get("watch_patterns"),
+        notify_on_complete=notify_on_complete,
+        watch_patterns=watch_patterns,
     )
 
 
