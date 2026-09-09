@@ -2423,11 +2423,12 @@ install_node_deps() {
         # installed", hiding the degradation from the user (#77003). Now it
         # fails the install outright instead of burying the warning (#85297).
         # Capture npm output so failures are diagnosable (#87340).
-        local npm_log
+        local npm_log npm_status=0
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
-                >"$npm_log" 2>&1; then
-            log_error "npm install failed or timed out; Node.js dependencies were not installed"
+        run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel=error \
+            >"$npm_log" 2>&1 || npm_status=$?
+        if [ "$npm_status" -ne 0 ]; then
+            log_error "npm install failed or timed out (exit $npm_status); Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
                 log_error "npm output:"
                 cat "$npm_log" >&2

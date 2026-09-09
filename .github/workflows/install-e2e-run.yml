@@ -81,6 +81,9 @@ jobs:
           echo "--- subuid/subgid for $(id -un)"
           grep "^$(id -un):" /etc/subuid /etc/subgid || echo "  (none — sandbox will say so)"
 
+      - name: Verify npm trusts only the intended sandbox CA
+        run: python3 tests/install/test_sandbox_node_tls.py
+
       - name: Run install + update E2E
         run: |
           set -euo pipefail
