@@ -114,5 +114,27 @@ class SandboxNodeTLS(unittest.TestCase):
                          'CERT|certificate|SELF_SIGNED|UNABLE_TO_VERIFY')
 
 
+class SandboxNodeHeaders(unittest.TestCase):
+    def select_headers(self, override):
+        script = (REPO / 'scripts/dev-sandbox.sh').read_text()
+        start = script.index('NODE_DIR="${DEV_SANDBOX_NODE_DIR:-}"')
+        end = script.index('WAYLAND_SOCKET=""', start)
+        # Exercise the production selection block with a host Node present.
+        command = ("command() { [ \"$*\" = '-v node' ] && "
+                   "printf '/usr/local/bin/node\\n'; };\n" +
+                   script[start:end] + '\nprintf "%s" "$NODE_DIR"')
+        env = {'PATH': os.environ['PATH']}
+        if override is not None:
+            env['DEV_SANDBOX_NODE_DIR'] = override
+        return subprocess.check_output(['bash', '-ceu', command], env=env, text=True)
+
+    def test_host_node_does_not_override_installed_node_headers(self):
+        self.assertEqual(self.select_headers(None), '')
+
+    def test_explicit_header_directory_is_preserved(self):
+        self.assertEqual(self.select_headers('/nix/store/test-node'),
+                         '/nix/store/test-node')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
